@@ -12,13 +12,13 @@ def cli(): ...
 
 operator_help = '''
 The anchovies plugin path of a Downloader to run.
-Examples: 
-    `-o Downloader` runs the base downloader.
-    `-o some_plugin.Downloader` runs the downloader from anchovies.plugins.some_plugin.
+Examples: `-op Downloader` runs the base downloader. 
+`-op some_plugin.Downloader` runs 
+the downloader from anchovies.plugins.some_plugin.
 '''.strip()
 
 
-@cli.command()
+@cli.command(help='Start a single anchovy!')
 @click.option('--id', help='The ID of the anchovy to schedule.')
 @click.option('--user', '-u', help='The User of the anchovy to schedule.')
 @click.option('--operator', '-op', required=True, help=operator_help)
