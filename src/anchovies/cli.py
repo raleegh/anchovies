@@ -21,12 +21,12 @@ the downloader from anchovies.plugins.some_plugin.
 @cli.command(help='Start a single anchovy!')
 @click.option('--id', help='The ID of the anchovy to schedule.')
 @click.option('--user', '-u', help='The User of the anchovy to schedule.')
-@click.option('--operator', '-op', required=True, help=operator_help)
-@click.option('--config', '-C', help='Config yaml as a string input.')
+@click.option('--operator-cls', '-op', required=True, help=operator_help)
+@click.option('--config', '-c', help='Config yaml as a string input.')
 @click.option('--config-file', '-f', help='Config yaml file path location.')
 @click.option('--service', '-S', is_flag=True, help='toggle the Service execution mode (defaulting to task execution mode)')
 @click.option('--execution-timeout', '-t', help='the timeout for a single batch')
-@click.option('--upstream', '-U', multiple=True, help='Upstream Anchovy IDs.')
+@click.option('--upstream', '-up', multiple=True, help='Upstream Anchovy IDs.')
 @click.option('--enabled', '-e', multiple=True, help='Enable a particular table.')
 @click.option('--disabled', '-d', multiple=True, help='Disable a particular table.')
 @click.option('--metastore', help='the path/connection uri for the configured metastore')
@@ -42,7 +42,7 @@ the downloader from anchovies.plugins.some_plugin.
         "plugins import path."
     ))
 def run(
-    operator: str,
+    operator_cls: str,
     id: str=None, 
     user: str=None, 
     *, 
@@ -52,7 +52,7 @@ def run(
     anchovy = Anchovy(id, user)
     kwds.update('is_task_executor', not service)
     res, exc = anchovy.run_with_exception_handling(
-        operator, 
+        operator_cls, 
         **kwds
     )
     click.echo(res.dump())
