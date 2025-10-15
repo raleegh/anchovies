@@ -1,0 +1,32 @@
+[project]
+name = "anchovies"
+version = "0.0.0a0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.3.0",
+    "gevent>=25.9.1",
+    "python-dateutil>=2.9.0.post0",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+sql = [
+    "dataset>=1.6.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "pytest-env>=1.1.5",
+]
+
+[tool.pytest_env]
+GEVENT_SUPPORT = true
+ACHVY_HOME = '~/.anchovies/test/'
+ACHVY_CNXN__TEST_CNXN__ARG1 = 'foo'
+ACHVY_CNXN__TEST_NO_CONNECT__ARG1 = 'bar'
+ACHVY_CNXN__DIFF_CNXN__ARG1 = 'something'
+ACHVY_CNXN__JSON_CNXN__JSONDATA = '{"arg1": "haha"}'
