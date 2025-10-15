@@ -61,8 +61,4 @@ def run(
 
 
 if __name__ == '__main__': 
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logging.getLogger('anchovies').setLevel(logging.DEBUG)
-    # TODO: add logging config per python guide
     cli()

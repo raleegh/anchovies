@@ -46,11 +46,11 @@ __all__ = [
     'HOME',
     'HOST',
     'PORT',
-    'EXECUTION_TIMEOUT',
     'SESSION',
     'BATCH', 
     'CONTEXT',
     'TASK',
+    'LOGGING_CONFIG_FILE',
     # Context magics
     'context',
     'session',
@@ -58,6 +58,11 @@ __all__ = [
     'task',
     'Session',
     'Batch',
+    # runtime magic
+    'runtime',
+    'get_config', 
+    'anchovies_import',
+    'import_runtime_from_config',
     # Downloaders & execution
     'Anchovy',
     'Downloader', 
@@ -83,9 +88,6 @@ __all__ = [
     'Connection',
     'ConnectionMemo',
     'ConnectionFairy',
-    # Plugins
-    'Plugin',
-    # TODO: import magics
     # Datastore
     'Datastore',
     'FileInfo',
@@ -142,16 +144,14 @@ METASTORE = getenv('METASTORE')
 HOME = getenv('HOME', '~/.anchovies')
 HOST = socket.gethostbyname(socket.gethostname())
 PORT = getenv('PORT', '8080')
-# SESSION_FACTORY = getenvimport('SESSION_FACTORY')
-# BATCH_FACTORY = getenvimport('BATCH_FACTORY')
-EXECUTION_TIMEOUT = cast(int | None, getenv('EXECUTION_TIMEOUT', astype=int))
 EXECUTION_POLICY = cast(Literal['UNSAFE', 'RAISE'], getenv('EXECUTION_POLICY', 'UNSAFE'))
 SESSION = cvar.ContextVar('SESSION', default=None)
 CONTEXT = cvar.ContextVar('CONTEXT', default=None)
 BATCH = cvar.ContextVar('BATCH', default=None)
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.CRITICAL)
+logger.setLevel(logging.INFO)
 LOGGING_CONFIG_FILE = getenv('LOGGING_CONFIG_FILE')
 if LOGGING_CONFIG_FILE: 
     logging.config.fileConfig(LOGGING_CONFIG_FILE)
