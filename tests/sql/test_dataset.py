@@ -32,7 +32,7 @@ def test_insert_many(dataset):
     assert sample['name'] == rows[2]['name']
 
 
-def test_scd_upsert(dataset): 
+def test_scd_insert_many(dataset): 
     rows = [
         {'guid': 'ABC', 'price': 3.0, 'product_id': 'pr2'},
         {'guid': 'DEF', 'price': 4.0, 'product_id': 'pr2'},
@@ -41,9 +41,9 @@ def test_scd_upsert(dataset):
     dataset.table_cls = ScdTable
     tbl = dataset.create_table('test_scd', 'guid', 'str')
     with dataset: 
-        inserted = tbl.upsert_many(rows)
+        inserted = tbl.insert_many(rows)
     with dataset: 
-        inserted = tbl.upsert_many(rows)
+        inserted = tbl.insert_many(rows)
     assert isinstance(tbl, ScdTable)
     assert tbl.count() == 6
     assert tbl.count(_del=None) == 3

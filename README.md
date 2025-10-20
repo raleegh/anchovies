@@ -8,7 +8,7 @@ In order to circumvent complex orchestration and overhead, anchovies relies on t
 ## Getting started
 Install anchovies from git:
 ```shell
-$ pip install git+https://github.com/raleegh/anchovies.git[sftp]
+$ pip install "git+https://github.com/raleegh/anchovies.git[sftp]"
 # this is installing the sftp "plugin" as well
 ```
 Configure a downloader anchovy by writing a Configuration Document:
@@ -37,7 +37,7 @@ $ anchovy start -op sftp.CsvDownloader --id sales_sftp
         * [Config file](#config-file)
         * [Task & Service execution](#task--service-execution)
     * [Context](#context)
-    * [Metastore](#metastore)
+    * [Datastore](#datastore)
     * [Connections](#connections)
     * [Plugins & customization](#plugins--customization)
         * [Building a custom downloader](#building-a-custom-downloader)
@@ -98,24 +98,25 @@ When an anchovy executes, the entire anchovy is wrapped within "context". This i
         * When deploying to production, set the user to "prod" or use the `--prod` flag. By default, the "prod" user tag will still be associated to all objects.
 * Batch contains orchestration information
 
-For example, when using `--user tasytuna`, the metastore will be built with the following structure: 
+For example, when using `--user tasytuna`, the datastore will be built with the following structure: 
 ```
 $ACHVY_HOME/tasytuna/<anchovy id>/
     - $tables/
     - $checkpoints/
     - $task_logs/
+    - data/
 ```
 
 Developers can retrieve any level of context at any time via the `context()`, `session()`, and `batch()` magics.
 
-### Metastore
+### Datastore
 As anchovies download data, they need to record "metadata". This metadata comes in the following forms:
 * table metadata (/$tables)
 * checkpoint metadata (/$checkpoints)
 * task metadata (/$task_logs)
 * results (/$results)
 
-By default, your anchovies will build a metastore in the local filesystem with this information. This is good for when anchovies run locally and re-use the same execution environment, such as in local development.
+By default, your anchovies will build a datastore in the local filesystem with this information. This is good for when anchovies run locally and re-use the same execution environment, such as in local development.
 
 <!-- 
 ### Tasks & task logs
@@ -235,7 +236,7 @@ class DynamicDiscoveryDownloader(Downloader):
 This method should always provide ALL tables in the associated datastore that are available for integration. Developers should use the `batch().tbls` property to retrieve "active" tables. Additionally, because of source/sink, the `Downloader.sources` property will contain the names of all the applied sources based on source/sink.
 
 #### Checkpoints
-As your custom downloader reads data, it should record the state of the integration & tables. This can be done with `Checkpoint`. You can use the magic `context()` method to retrieve the `Checkpoint` associated with the current context. At the end of each `Batch`, `Checkpoint` will be flushed to the metastore. In either task or service execution, you should checkpoint as frequently as possible. The reason is slightly different for each use case: 
+As your custom downloader reads data, it should record the state of the integration & tables. This can be done with `Checkpoint`. You can use the magic `context()` method to retrieve the `Checkpoint` associated with the current context. At the end of each `Batch`, `Checkpoint` will be flushed to the datastore. In either task or service execution, you should checkpoint as frequently as possible. The reason is slightly different for each use case: 
 * in task execution, the user may limit the execution time with `ACHVY_EXECUTION_TIMEOUT`, so your downloader could shutdown at any time due to this
 * in service execution, the service will "crash" if an unhandled exception occurs. keeping your checkpoint up-to-date as you download will ensure that if the service does crash, the state is recorded correctly
 
@@ -266,7 +267,6 @@ class MyDownloader(Downloader):
     * threading within anchovy
     * splits to workers based on `--worker-num/--workers`
 * locking mechanism
-* better metastore customization
 * dbt integration
     * add dbt as a Downloader and create tables for:
         * seed
@@ -277,7 +277,7 @@ class MyDownloader(Downloader):
     * add a command `anchovy school run --plan <<plan file>>`
         * execute all commands in the "plan file"
         * for each command, create a results.json
-        * on exit, upload files to metastore: 
+        * on exit, upload files to datastore: 
             ```
             $RESULTS_HOME/user/
                 anchovy1_results.json
@@ -285,6 +285,10 @@ class MyDownloader(Downloader):
                 anchovy2_dbt_docs.html
             ```
 * option to allow failures in table execution
+* streaming buffers & datastore such as: 
+    * azure event hubs
+    * aws kinesis
+    * kafka
 
 
 ## Appendix
@@ -300,8 +304,7 @@ Almost configs can be configured via CLI option, ENV Variable, and `config.yaml`
 * `-U` / `ACHVY_UPSTREAM` / `config.upstream` - a list of upstream anchovy ids. in the CLI, this can be used multiple times (e.g. `-U anch1 -U anch2`).
 * `-e` / `ACHVY_ENABLED` / `config.enabled` - a list of enabled tables. this will restrict the operator to ONLY use these tables. in the CLI, this can be used multiple times.
 * `-d` / `ACHVY_DISABLED` / `config.disabled` - a list of disabled tables. this will restrict the operator to SKIP these tables, overriding the `enabled` setting. in the CLI, this can be used multiple times.
-* `--metastore` / `ACHVY_METASTORE` / `config.metastore` - the path/connection uri for the configured metastore
-* `--metastore-cls` / `ACHVY_METASTORE_CLS` / `config.metastore_cls` - the runtime class to use for the metastore. use an anchovies plugins import path.
+* `--datastore` / `ACHVY_DATASTORE` / `config.datastore` - the path/connection uri for the configured datastore
     * `--checkpoint-cls` / `ACHVY_CHECKPOINT_CLS` / `config.checpoint_cls` - the runtime checkpoint class to use. use an anchovies plugins import path.
     * `--task-store-cls` / `ACHVY_TASK_STORE_CLS` / `config.task_store_cls` - the runtime class to use for the task store. use an anchovies plugins import path.
     * `--tbl-store-cls` / `ACHVY_TBL_STORE_CLS` / `config.tbl_store_cls` - the runtime tbl store class to use. use an anchovies plugins import path.

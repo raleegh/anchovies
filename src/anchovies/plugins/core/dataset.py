@@ -2,32 +2,37 @@ import os
 import io
 import inspect
 import itertools
-import concurrent.futures
 import sqlalchemy.types
 import uuid
+import logging
 from abc import ABC
 from datetime import date, datetime
 from decimal import Decimal
-from functools import partial
-from typing import Any, Sequence
-from dataset import Database, Table
-from dataset.types import Types as OriginalTypes
-from dataset.table import DatasetException, SQLATable, Column
-from sqlalchemy import select, func
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from typing import Any, Sequence, Callable
+try:
+    from dataset import Database, Table
+    from dataset.types import Types as OriginalTypes
+    from dataset.table import DatasetException, SQLATable, Column
+    from sqlalchemy import select, func
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session
+    String = sqlalchemy.types.Unicode
+    Binary = sqlalchemy.types.LargeBinary
+except ImportError: 
+    class Database: ...
+    class Table: ...
+    class OriginalTypes: ...
 from anchovies.sdk import Connection
 
 
+logger = logging.getLogger('anchovies.dataset')
 PRIMARY_LENGTH = int(os.getenv('DATASET_PRIMARY_LENGTH', 40))
 DEFAULT_LENGTH = int(os.getenv('DATASET_DEFAULT_LENGTH', 255))
 CHUNKSIZE = int(os.getenv('DATASET_CHUNKSIZE', io.DEFAULT_BUFFER_SIZE * 10))
 SAMPLE_SIZE = os.getenv('DATASET_SAMPLE_SIZE', None)
 SAMPLE_SIZE = int(SAMPLE_SIZE) if SAMPLE_SIZE else None
-DATA_RETENTION_SECONDS = os.getenv('DATASET_DATA_RETENTION_SECONDS', None)
-DATA_RETENTION_SECONDS = int(DATA_RETENTION_SECONDS) if DATA_RETENTION_SECONDS else None
-String = sqlalchemy.types.Unicode
-Binary = sqlalchemy.types.LargeBinary
+DELETED_TTL = os.getenv('DATASET_DELETED_TTL', None)
+DELETED_TTL = int(DELETED_TTL) if DELETED_TTL else None
 DataStream = Sequence[dict[str, Any]]
 
 
@@ -52,7 +57,7 @@ class Dataset(Database, Connection):
     def __getitem__(self, table_name) -> 'TablePlus':
         return super().__getitem__(table_name)
     
-    def create_table(self, table_name, primary_id=None, primary_type=None, primary_increment=None) -> 'TablePlus':
+    def create_table(self, table_name, primary_id=None, primary_type=None, primary_increment=None, **settings) -> 'TablePlus':
         """Create a new table.
 
         Either loads a table or creates it if it doesn't exist yet. You can
@@ -90,6 +95,7 @@ class Dataset(Database, Connection):
                     primary_type=primary_type,
                     primary_increment=primary_increment,
                     auto_create=True,
+                    **settings,
                 )
             return self._tables.get(table_name)
         
@@ -99,6 +105,19 @@ class Dataset(Database, Connection):
         if types: 
             tbl.sync_columns(types)
         return tbl
+
+    def watch_primary_type(self, primary_id: str | tuple, stream: DataStream) -> tuple[tuple, DataStream]: 
+        '''Observe the primary types of a table based on 1 row.'''
+        for row in stream: 
+            break
+        types = list()
+        for col in primary_id: 
+            val = row.get(col) 
+            if val is None: 
+                raise ValueError(f'A null value was received for {col} in {self} on row {row}.')
+            t = self.db.types.guess(val)
+            types.append(t)
+        return tuple(types), itertools.chain([row], stream)
 
 
 class TablePlus(Table): 
@@ -122,6 +141,8 @@ class TablePlus(Table):
         auto_create=False, 
         primary_length: int=PRIMARY_LENGTH,
         default_length: int=DEFAULT_LENGTH,
+        sort_by: dict=None,
+        **settings,
     ):
         super().__init__(database, table_name, primary_id, primary_type, primary_increment, auto_create)
         if self._primary_type is OriginalTypes.integer: 
@@ -131,6 +152,7 @@ class TablePlus(Table):
             self._primary_type = tuple(self._primary_type for _ in range(len(self._primary_id)))
         self._primary_length = primary_length
         self._default_length = default_length
+        self._sort_by = sort_by
         # TODO: ensure that in length based databases default length works
 
     def __enter__(self): 
@@ -192,6 +214,7 @@ class TablePlus(Table):
     def watch_columns(self, stream: DataStream, *, sample_size: int=SAMPLE_SIZE) -> tuple[dict, DataStream]: 
         sync_row = {}
         watched = list()
+        stream = iter(stream)
         for i, row in enumerate(stream):
             # Only get non-existing columns.
             sync_keys = list(sync_row.keys())
@@ -203,7 +226,7 @@ class TablePlus(Table):
                 break
         return sync_row, itertools.chain(watched, stream)
 
-    def sync_columns(self, row, ensure, types=None):
+    def sync_columns(self, row, ensure=True, types=None):
         """Create missing columns (or the table) prior to writes.
 
         If automatic schema generation is disabled (``ensure`` is ``False``),
@@ -229,16 +252,19 @@ class TablePlus(Table):
         return out
     _sync_columns = sync_columns
 
-    def insert_many_no_sync(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, sync_func=None, **kwds) -> int:
+    def insert_many(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, setup_hook: Callable=0, **kwds) -> int:
         sample_size = sample_size if CHUNKSIZE == -1 else None
         for chunk in chunked_with_ceiling(rows, chunk_size): 
             # Get columns name list to be used for padding later.
             columns, chunk = self.watch_columns(chunk, sample_size=sample_size)
-            if sync_func is not None: 
-                sync_func(columns, **kwds)
+            if setup_hook is not None:
+                if setup_hook == 0: 
+                    setup_hook = type(self).sync_columns
+                setup_hook(self, columns, **kwds)
             try: 
-                return self.insert_bulk(rows, columns)
+                return self.insert_bulk(chunk, columns)
             except NotImplementedError: 
+                logger.warning(f'{type(self)}.insert_bulk() not implemented -> use sqlalchemy')
                 pass
             chunk = self.cleanup(chunk, columns)
             with Session(self.db.executable) as ses, ses.begin(): 
@@ -248,26 +274,14 @@ class TablePlus(Table):
             
     def insert_bulk(self, stream: DataStream, columns: dict=None) -> int: 
         raise NotImplementedError(f'This must be provided')
-
-    def insert_many(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, ensure=None, types=None) -> int:
-        return self.insert_many_no_sync(
-            rows, 
-            chunk_size, 
-            sample_size=sample_size,
-            sync_func=self.sync_columns,
-            ensure=ensure, 
-            types=types,
-        )
     
     def cleanup(self, stream: DataStream, columns: dict) -> DataStream: 
         stream = map(enforce_columns(columns), stream)
-        stream = dedupe(self._primary_id)(stream)
-        # TODO: should this be a setting?
         return stream 
     
 
 class ScdTable(TablePlus): 
-    '''A table that can run simplified SCD-style upserts.
+    '''A table that can run simplified SCD-style inserts.
     
     An SCD is a "slowly changing dimension". This means that the table 
     keeps a change-log of the data, rather than updating matching rows.
@@ -279,15 +293,20 @@ class ScdTable(TablePlus):
     '''
     def __init__(self, database, table_name, primary_id = None, primary_type = None, 
         primary_increment = None, auto_create=False, primary_length = PRIMARY_LENGTH, 
-        default_length = DEFAULT_LENGTH, data_retention_seconds: int=DATA_RETENTION_SECONDS,
+        default_length = DEFAULT_LENGTH, sort_by: dict[str, str]=None,
+        deleted_ttl: int=DELETED_TTL,
     ):
+        sort_by = sort_by or dict()
+        if '_seq' not in sort_by: 
+            sort_by['_seq'] = 'DESC'
         super().__init__(database, table_name, primary_id, primary_type, 
-                         primary_increment, auto_create, primary_length, default_length)
+                         primary_increment, auto_create, primary_length, default_length,
+                         sort_by)
         self._primary_increment = False
         if '_seq' not in self._primary_id: 
             self._primary_id = tuple([*self._primary_id, '_seq'])
             self._primary_type = tuple([*self._primary_type, 'int'])
-        self.data_retention_seconds = data_retention_seconds
+        self.deleted_ttl = deleted_ttl
 
     def sync_columns(self, row, ensure=None, types=None):
         row['_del'] = 0
@@ -296,40 +315,61 @@ class ScdTable(TablePlus):
     def cleanup(self, stream, columns):
         return super().cleanup(stream, columns)
 
-    def upsert_many(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, ensure=None, types=None, **kwds) -> int:
+    def insert_many(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, ensure=None, types=None, **kwds) -> int:
         self._sequence_no_local = seq = SequenceNumberMagic()
         # TODO: defend against overlap by checking max seq no in table
         rows = seq(rows)
         # TODO: add consideration for threading
-        inserts = self.insert_many(rows, chunk_size=chunk_size, sample_size=sample_size, ensure=ensure, types=types)
-        temp_types = {col: dtype for col, dtype in zip(self._primary_id, self._primary_type)}
-        with self.db.create_temp_table('_seq', types=temp_types) as tmp:
-            tbl = self.table
-            primary_keys = tuple(tbl.c[p] for p in self._primary_id if p != '_seq')
-            stmt = tmp.table.insert().from_select(
-                self._primary_id,
-                select(*primary_keys, func.min(tbl.c._seq))
-                    .where(tbl.c._seq >= seq.first)
-                    .group_by(*primary_keys)
-            )
-            self.db.executable.execute(stmt)
-            subquery = select(tmp.table.c[p] for p in self._primary_id if p != '_seq')
-            for k in self._primary_id: 
-                if k == '_seq': 
-                    continue
-                subquery = subquery.where(tbl.c[k] == tmp.table.c[k])
-            stmt = (
-                tbl.update()
-                    .where(tbl.c._seq < seq.first)
-                    .where(subquery.exists())
-                    .values(_del=seq.first)
-            )
-            self.db.executable.execute(stmt)
-        self.apply_data_retention()
+        inserts = super().insert_many(rows, chunk_size=chunk_size, sample_size=sample_size, ensure=ensure, types=types)
+        self.drop_duplicates(marker=seq.last)
+        self.drop_expired()
         return inserts
     
-    def apply_data_retention(self):
-        if not (secs := self.data_retention_seconds): 
+    def drop_duplicates(self, marker: int=None): 
+        '''Remove records that are active & duplicated based on the configured settings.
+        
+        Constructs a ROW_NUMBER over the primary_id columns sorting by `sort_by` properties, 
+        always including _seq.
+        For example: 
+        ```
+        UPDATE tbl SET _del=123
+        WHERE _seq IN (
+            SELECT _seq
+            FROM tbl WHERE _del IS NULL 
+            QUALIFY ROW_NUMBER() OVER(PART <primary id> ORD <sort by>) = 1
+        )
+        ```
+        '''
+        if not marker: 
+            marker = SequenceNumberMagic().first
+        tbl = self.table
+        new_temp = self.db.create_temp_table
+        part = (c for c in self._primary_id if c != '_seq')
+        sort = (
+            (tbl.c[col].asc() if sort_option.upper() == 'ASC' else tbl.c[col].desc())
+            for col, sort_option in self._sort_by.items()
+        )
+        with new_temp('_seq', 'int') as tmp:
+            row_num = func.row_number().over(partition_by=part, order_by=sort).label('_row_num')
+            query = select(tbl.c._seq, row_num).filter(tbl.c._del == None).subquery()
+            query = select(query.c._seq).filter(query.c._row_num > 1)
+            stmt = tmp.table.insert().from_select(
+                ('_seq',), 
+                query
+            )
+            self.db.executable.execute(stmt)
+            stmt = (
+                tbl.update()
+                    .where(tbl.c._seq.in_(tmp.table))
+                    .values(_del=marker)
+            ) 
+            self.db.executable.execute(stmt)
+
+    def drop_expired(self):
+        '''Remove records that are expired based on the `deleted_ttl` setting.'''
+        if not (secs := self.deleted_ttl): 
+            return
+        if secs < 0: 
             return
         marker = (datetime.now().timestamp() - secs) * 1_000_000
         self.delete(_del={'lt': marker})
@@ -415,25 +455,10 @@ class enforce_columns:
         return dict_like
 
 
-class dedupe: 
-    def __init__(self, keys=()):
-        self.keys = keys
-    
-    def __call__(self, stream: list[dict]):
-        self.data = dict()
-        for row in stream: 
-            keys = tuple(row[x] for x in self.keys)
-            self.data[keys] = row
-        return self
-    
-    def __iter__(self): 
-        yield from self.data.values()
-
-
 class SequenceNumberMagic: 
     def __init__(self): 
         self.first = int(datetime.now().timestamp() * 1_000_000)
-        self._current = self.first - 1
+        self.last = self.first
 
     def __call__(self, stream: DataStream): 
         self.stream = stream
@@ -445,6 +470,7 @@ class SequenceNumberMagic:
             yield row
 
     def next(self): 
-        self._current += 1
-        return self._current
+        cur = self.last
+        self.last += 1
+        return cur
     

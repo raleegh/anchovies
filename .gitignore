@@ -17,6 +17,7 @@ uv.lock
 .pytest_cache
 .vscode
 .coverage
+.data/
 
 # mac data file
 .DS_STORE

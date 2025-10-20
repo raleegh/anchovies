@@ -1,7 +1,7 @@
 [project]
 name = "anchovies"
 version = "0.0.0a0"
-description = "Add your description here"
+description = "a lightweight ETL library"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,6 +18,10 @@ anchovy = "anchovies.cli:cli"
 sql = [
     "dataset>=1.6.2",
 ]
+blob = [
+    "azure-identity>=1.25.1",
+    "azure-storage-blob>=12.27.0",
+]
 
 [dependency-groups]
 dev = [
@@ -33,3 +37,5 @@ ACHVY_CNXN__TEST_CNXN__ARG1 = 'foo'
 ACHVY_CNXN__TEST_NO_CONNECT__ARG1 = 'bar'
 ACHVY_CNXN__DIFF_CNXN__ARG1 = 'something'
 ACHVY_CNXN__JSON_CNXN__JSONDATA = '{"arg1": "haha"}'
+AZURE_BLOB_ACCOUNT_URL = 'blob.windows.net'
+AZURE_BLOB_CREDENTIAL = '???'

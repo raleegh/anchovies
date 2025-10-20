@@ -1,5 +1,5 @@
 from pytest import fixture
-from anchovies.sdk import Metastore, Session, Downloader, Connection, ConnectionMemo
+from anchovies.sdk import Datastore, Session, Downloader, Connection, ConnectionMemo
 
 
 @fixture
@@ -26,7 +26,7 @@ tbls:
 '''.strip()
 
 
-class TestDownloader: 
+class TestDownloader(Downloader): 
     ...
 
 
@@ -38,12 +38,13 @@ def session(config_str):
 
 @fixture
 def newmeta(session): 
-        with Metastore() as meta: 
-             yield meta
+        with Datastore.new() as meta: 
+            session.datastore = meta
+            yield meta
 
 
 @fixture
-def downloader(): 
+def downloader(session): 
     class TestConnection(Connection): 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)

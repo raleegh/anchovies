@@ -1,16 +1,16 @@
 import datetime as dt
 from pytest import fixture
-from anchovies.sdk import Metastore, Checkpoint, CachedCheckpoint
+from anchovies.sdk import Datastore, Checkpoint, CachedCheckpoint
 
 
 @fixture
-def newckpoint(newmeta: Metastore): 
+def newckpoint(newmeta: Datastore): 
     with Checkpoint(newmeta) as ck: 
         yield ck
 
 
 @fixture
-def newcachedckpoint(newmeta: Metastore): 
+def newcachedckpoint(newmeta: Datastore): 
     with CachedCheckpoint(newmeta) as ck: 
         yield ck
 
@@ -30,7 +30,7 @@ def test_chached(newmeta):
     with ck: 
         assert ck.data
         ck.put('some.checkpoint', 'update')
-        assert ck.data['some.checkpoint'] == 'update'
+        assert ck['some', 'checkpoint'] == 'update'
 
 
 def test_hint(newckpoint): 

@@ -10,17 +10,17 @@ import threading as th
 import logging
 import logging.config
 import importlib
+import time
 from abc import ABC, abstractmethod
 from collections import UserDict, UserList, namedtuple
 from contextlib import ExitStack
 from types import SimpleNamespace, ModuleType, MethodType
-from typing import cast, Literal, Iterator, Callable, Sequence
+from typing import cast, Any, Literal, Iterator, Callable, Sequence
 from functools import cache as memoize
 from functools import cached_property as memoprop
 from datetime import datetime, UTC
 from copy import copy, deepcopy
 
-import dateutil
 import gevent
 import gevent.queue as gqueue
 import yaml
@@ -42,20 +42,19 @@ __all__ = [
     # Environment
     'ID', 
     'USER',
-    'METASTORE',
     'HOME',
     'HOST',
     'PORT',
     'SESSION',
     'BATCH', 
     'CONTEXT',
-    'TASK',
+    # 'TASK',
     'LOGGING_CONFIG_FILE',
     # Context magics
     'context',
     'session',
     'batch',
-    'task',
+    # 'task',
     'Session',
     'Batch',
     # runtime magic
@@ -81,9 +80,11 @@ __all__ = [
     'source',
     'sink',
     # Task API
-    # ..., #TODO
     'Task',
+    'TaskGuide',
+    'TaskCallback',
     'as_task',
+    'on_task',
     # Connections
     'Connection',
     'ConnectionMemo',
@@ -91,20 +92,13 @@ __all__ = [
     # Datastore
     'Datastore',
     'FileInfo',
-    'FilesystemDatastore',
-    'Metastore',
-    'SpecificMetastore',
+    'Microservice',
     'BaseCheckpoint',
     'Checkpoint',
     'CachedCheckpoint',
     'TaskStore',
     'TblStore',
 ]
-
-
-logger = logging.getLogger('anchovies')
-info = logger.info
-debug = logger.debug
 
 
 class BaseAnchovyException(Exception): ...
@@ -119,6 +113,7 @@ class AnchovyStreamingError(BaseAnchovyException, RuntimeError): ...
 class BrokenContext(BaseAnchovyException): ...
 class BrokenConfig(BaseAnchovyException, RuntimeError): ...
 class BadMagicImport(BaseAnchovyException, ImportError): ...
+class TaskCallbackFailedWarning(Warning): ...
 
 
 def getenv(var, default=None, *, astype: type=None): 
@@ -140,21 +135,25 @@ def findenv(prefix):
 
 ID = getenv('ID')
 USER = getenv('USER')
-METASTORE = getenv('METASTORE')
 HOME = getenv('HOME', '~/.anchovies')
 HOST = socket.gethostbyname(socket.gethostname())
 PORT = getenv('PORT', '8080')
-EXECUTION_POLICY = cast(Literal['UNSAFE', 'RAISE'], getenv('EXECUTION_POLICY', 'UNSAFE'))
 SESSION = cvar.ContextVar('SESSION', default=None)
 CONTEXT = cvar.ContextVar('CONTEXT', default=None)
 BATCH = cvar.ContextVar('BATCH', default=None)
 
 
-logging.basicConfig(level=logging.CRITICAL)
+logger = logging.getLogger('anchovies')
 logger.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.CRITICAL,
+    format='%(asctime)s %(levelname)s %(message)s -- (%(name)s)',
+)
 LOGGING_CONFIG_FILE = getenv('LOGGING_CONFIG_FILE')
 if LOGGING_CONFIG_FILE: 
     logging.config.fileConfig(LOGGING_CONFIG_FILE)
+info = logger.info
+debug = logger.debug
 
 
 def context() -> 'Session | Batch': 
@@ -171,6 +170,68 @@ def batch() -> 'Batch':
 
 def now(): 
     return datetime.now(UTC)
+
+
+def cached(key_prefix: str, *, ttl: float=-1, ttl_hook: Callable=None): 
+    '''Cache an item in the internal cache.
+    
+    Parameters: 
+    * ttl (float): set the time-to-live in seconds
+    * ttl_hook (Callable): alternatively, provide a hook to retrieve TTL 
+        at runtime
+    '''
+    def resolve_ttl(): 
+        if ttl_hook is not None: 
+            return ttl_hook() or ttl
+        return ttl
+    def decorator(func: Callable): 
+        def cached_func(*args, **kwds): 
+            cache = session().datastore.cache
+            key = cache.make_key(*args, **kwds)
+            if result := cache.get(key_prefix=key_prefix, key=key): 
+                return result
+            result = func(*args, **kwds)
+            ttl = resolve_ttl()
+            return cache.get_or_set(key_prefix=key_prefix, key=key, value=result, ttl=ttl)
+        return cached_func
+    return decorator
+
+
+def get_config(setting_name: str, default=None, /, astype: type=None): 
+    '''
+    Scan both the Environment & Session for configs/settings. This
+    will always return a str, UNLESS you use the `astype` arg, which 
+    will safely attempt to convert the value.
+    When the Environment & Session both have a value, the Session wins.
+    '''
+    from_env = getenv(setting_name.upper())
+    from_ses = None
+    if session():
+        from_ses = session().config.get(setting_name)
+    setting = from_ses if from_ses else from_env
+    if setting and astype is not None: 
+        try: 
+            return astype(setting)
+        except Exception as e: 
+            raise BadEnvironmentVariable(f'Could not cast {setting} from {setting_name} to {astype}.') \
+                from e
+    return setting or default
+
+
+def tuple_from_str(comma_sep_str: str) -> Sequence[str]: 
+    if comma_sep_str and not isinstance(comma_sep_str, str):
+        return tuple(comma_sep_str)
+    if comma_sep_str: 
+        return tuple(x.strip() for x in comma_sep_str.split(','))
+    return ()
+
+
+def bool_from_str(bool_str: str) -> bool: 
+    if isinstance(bool_str, bool): 
+        return bool_str
+    if not bool_str.strip(): 
+        return False
+    return bool_str[0].upper() == 'T' or bool_str[0].upper() == 'Y'
 
 
 class Cols(UserDict):
@@ -233,7 +294,29 @@ class SortedColSelect(UserDict):
 
 
 class Tbl: 
-    '''A data-stream with tabular structure.'''
+    '''A data-stream with tabular structure.
+    
+    Anchovies strictly uses MySQL/Oracle like naming on tables: meaning
+    a table's namespace/schema IS the originating anchovy. So if a Tbl is 
+    read and the namespace is "anchovy1", that Tbl is FROM anchovy1. This 
+    doesn't seem like a major stress, but in theory multiple anchovies could
+    touch the same table (by name), but in the namespace system, these would
+    all be different tables because they are owned by different anchovies.
+
+    For example:
+    ```
+    * anchovy1 - downloader
+        * contacts
+        * orders
+        * order_line_items
+    * anchovy2 - performing some kind of transform
+        * order_line_items
+    * anchovy3 - uploader
+        * anchovy1.contact -> schema.contacts
+        * anchovy1.orders -> schema.contact
+        * anchovy2.order_line_items -> schema.order_line_items
+        * ASSUMING, you have anchovy1/anchovy2 mapped to schema
+    '''
     def __init__(
         self, 
         name: str,
@@ -242,6 +325,7 @@ class Tbl:
         unique_by: ColSelect=None,
         set_by: ColSelect=None,
         sort_by: SortedColSelect=None,
+        deleted_ttl: int=None,
         # logical_timestamp
         **properties,
     ): 
@@ -251,10 +335,11 @@ class Tbl:
         self.unique_by = ColSelect(unique_by) or ColSelect()
         self.set_by = ColSelect(set_by) or ColSelect()
         self.sort_by = SortedColSelect(sort_by) or SortedColSelect()
+        self.deleted_ttl = deleted_ttl
         self.properties = properties
 
     def __str__(self):
-        return self.qualname
+        return self.name
 
     def __repr__(self):
         return f'`{self.qualname}`'
@@ -268,14 +353,16 @@ class Tbl:
         In an uploader, source tables will be qual'd with the 
         upstream anchovy id.
         Furthermore, tables will be "saved" ???
-        # TODO: really need to sort out how the metastore should interact when saving
-        #   in the role as an "uploader"
         '''
         return ((self.namespace or '') + '.' + self.name).strip('.')
-    
+
     @property
-    def savename(self): 
-        return self.qualname
+    def anchovy_id(self) -> str | None: 
+        return self.namespace or context().anchovy_id
+    
+    @anchovy_id.setter
+    def anchovy_id(self, id): 
+        self.namespace = id
     
     def info(self): 
         return {
@@ -290,6 +377,29 @@ class Tbl:
     
     def dump(self): 
         return json.dumps(self.info(), default=AnchoviesEncoder().default)
+    
+    def merge(self, other): 
+        '''Merge two Tbls, with the "other" arg winning.'''
+        new = copy(self)
+        for name, attr in inspect.getmembers(other): 
+            if name.startswith('_'): 
+                continue
+            if attr:
+                try:    
+                    setattr(new, name, attr)
+                except AttributeError: 
+                    pass # is property
+        # special combines
+        new.properties.update(**other.properties)
+        return new
+    
+    @classmethod
+    def from_namespace(cls, namespace: str):
+        '''Override the namespace argument permanently.'''
+        def builder(**kwargs): 
+            kwargs['namespace'] = namespace
+            return cls(**kwargs)
+        return builder
 
 
 class TblSet(UserDict): 
@@ -297,7 +407,7 @@ class TblSet(UserDict):
     def __init__(self, d=None, /, *args):
         kwargs = {}
         if args: 
-            kwargs = {t.qualname: t for t in args}
+            kwargs = {t.name: t for t in args}
         super().__init__(**d or {}, **kwargs)
 
     def __repr__(self):
@@ -306,24 +416,25 @@ class TblSet(UserDict):
             +', '.join(repr(tbl) for tbl in self) \
             +']'
 
-    # def __iter__(self):
-    #     yield from self.data.values()
-    # breaks chaining initialization :/ (altho VERY convenient)
-
     def add(self, other: Tbl):
+        if existing := self.data.get(other.qualname): 
+            other = other.merge(existing)
         self.data[other.qualname] = other
-        # TODO: merge table configs here
 
     def extend(self, other: 'TblSet'): 
         for tbl in other.values(): 
             self.add(tbl)
 
     def merge(self, other: 'TblSet'): 
-        '''Given another group of tables, combine them.'''
+        '''Given another group of tables, combine them.
+        
+        Because of the behavior of `Tbl.merge`, the "other" argument
+        will take precendence.
+        '''
         new = type(self)(self)
         for tbl in new.values(): 
             tbl = deepcopy(tbl)
-            if ltbl := other.get(tbl.qualname): 
+            if ltbl := other.get(str(tbl)): 
                 tbl = tbl.with_(ltbl)
             self.add(tbl)
         for tbl in other.values(): 
@@ -357,7 +468,7 @@ class Operator:
     '''
     def __init__(self): 
         self.streams = StreamGuide(self)
-        # self.tasks = TaskCollection(self)
+        self.task_callbacks = TaskGuide(self)
         self.connections = session().connections = ConnectionFairy(self)
         # connections acquired in startup
 
@@ -369,7 +480,7 @@ class Operator:
         upstream & downstream tables. Override this method to customize
         what tables are processed, such as in cases of "dynamic discovery".
         '''
-        yield from session().metastore.tbl_store
+        yield from session().datastore.tbl_store
 
     def run_streams(self, selection: TblSet, /, wrapped_by: Callable=None):
         selected_streams = self.streams.select(selection)
@@ -792,31 +903,68 @@ class StreamingPlan:
 
 
 class Downloader(Operator): 
-    '''An Operator focussed on downloading data to a datastore.'''
+    '''
+    Basic execution class at the core of anchovies.
+
+    Intended usage: 
+    ```
+    from sql.database.package import connect
+
+    def NewDownloader(Downloader): 
+        client = ConnectionMemo(connect)
+
+        @source('some_table')
+        def get_some_table(self, **kwds): 
+            yield from self.client.run_query('SELECT * FROM some_table')
+    ```
+    This would automatically ingest returned dictionaries from the client method
+    `some_table` into the default data buffer.
+
+    You can also override the `discover_tbls()` method to further customize 
+    table identification.
+    '''    
     def __init__(self):
         super().__init__()
         self.data_buffer_cls = runtime().DataBuffer
 
     @sink()
-    def default_sink(self, **kwds): 
-        # TODO: implement default sink logic
-        ...
+    def default_sink(self, stream, tbl, **kwds): 
+        buf = self.data_buffer_cls(tbl)
+        with buf: 
+            buf.writelines(stream)
 
 
 class Uploader(Operator): 
-    '''An Operator focussed on uploading data to a database.'''
+    '''
+    Basic execution class at the core of anchovies.
+
+    Intended usage: 
+    ```
+    from sql.database.package import connect
+
+    def NewDownloader(Downloader): 
+        client = ConnectionMemo(connect)
+
+        @source('some_table')
+        def get_some_table(self, **kwds): 
+            yield from self.client.run_query('SELECT * FROM some_table')
+    ```
+    This would automatically ingest returned dictionaries from the client method
+    `some_table` into the default data buffer.
+
+    You can also override the `discover_tbls()` method to further customize 
+    table identification.
+    '''
     def __init__(self):
         super().__init__()
         self.data_buffer_cls = runtime().DataBuffer
 
     @source()
-    def default_source(self, tbl, **kwds): 
-        # TODO: implement default sink logic
-        ...
-
-
-class TaskCollection: 
-    ...
+    def default_source(self, tbl: Tbl, **kwds): 
+        db = context().datastore.with_(anchovy_id=tbl.anchovy_id)
+        buf = self.data_buffer_cls(tbl.name, datastore=db)
+        with buf: 
+            yield from buf
 
 
 class Connection(SimpleNamespace):
@@ -913,16 +1061,16 @@ class ConnectionFairy:
         for id in self.ids:
             self.get_or_set(id)
 
-    def get_or_set(self, id) -> Connection | None: 
-        if already_set := self.data.get(id): 
-            return already_set
+    @cached('cnxn.open', ttl_hook=lambda: get_config('cnxn_ttl', -1, astype=int))
+    def get_or_set(self, id, **cnxn_settings) -> Connection | None: 
+        '''Retrieve an open connection or create it new!'''
         attrs = dict(self.find_args_for_cnxn(id))
         if not attrs: 
             raise AnchovyMissingConnection(
                 f'{self.op.__class__} was expecting '
                 f'connection with id {id}!'
             )
-        cnxn = self.ids[id](**attrs)
+        cnxn = self.ids[id](**attrs, **cnxn_settings)
         self.attach(id, cnxn)
 
     def attach(self, id: str, cnxn: Connection): 
@@ -948,7 +1096,10 @@ class Anchovy:
 
     @staticmethod
     def default_username(): 
-        return socket.gethostname().removesuffix('.local')
+        '''Derive a username for the process based on login'''
+        return os.getenv('USER') \
+            or os.getenv('USERNAME') \
+            or socket.gethostname().removesuffix('.local')
 
     def run(self, operator_cls: type[Downloader], /, **session_kwds): 
         ses = runtime().Session(operator_cls, self, **session_kwds)
@@ -974,44 +1125,37 @@ class Anchovy:
         return results, exception
 
 
-# TODO: is this needed?
-# REGISTERED_PLUGINS = dict()
-# PLUGINS_DISCOVERED = False
-
-
-# class Plugin: 
-#     def __init__(self, name, module): 
-#         self.name = name 
-#         self.module = module
-
-#     @staticmethod
-#     def discover(): 
-#         if PLUGINS_DISCOVERED: return
-#         import anchovies.plugins as plugins
-#         for possible_module_name in dir(plugins): 
-#             possible_module = getattr(plugins, possible_module_name)
-#             if isinstance(possible_module, ModuleType): 
-#                 plugin = Plugin(possible_module_name, possible_module)
-#                 REGISTERED_PLUGINS[possible_module_name] = plugin
-#         # TODO: validate
-#         #   after running, metastores should register (for example)
-        
-#     @staticmethod
-#     def plugins(): 
-#         Plugin.discover()
-#         yield from REGISTERED_PLUGINS
+class Plugin: 
+    '''A plugin module from `anchovies.plugins`.
     
-#     @staticmethod
-#     def find(plugin): 
-#         Plugin.discover()
-#         try: 
-#             return REGISTERED_PLUGINS[plugin]
-#         except KeyError as e: 
-#             raise AnchovyPluginNotFound from e
-        
+    This class doesn't get used so much as for ensuring all 
+    installed datastores get recognized.
+    '''
+    def __init__(self, name, module): 
+        self.name = name 
+        self.module = module
+
+    @memoize
+    @staticmethod
+    def discover(plugin: str=None): 
+        '''Walk `anchovies.plugins` and import all.'''
+        plugin_list = anchovies_import(plugin)
+        plugins = dict()
+        for name, possible_plugin in inspect.getmembers(plugin_list):
+            full_path = '.'.join((plugin or '', name)).strip('.')
+            if name.startswith('__'): 
+                continue 
+            if isinstance(possible_plugin, ModuleType):
+                if not possible_plugin.__name__.startswith('anchovies'): 
+                    continue
+                plugins[full_path] = Plugin(full_path, possible_plugin)
+                found = Plugin.discover(full_path)
+                plugins.update(**found)
+        return plugins
+            
 
 @memoize
-def anchovies_import(path: str): 
+def anchovies_import(path: str=None): 
     '''
     Import an object in the `anchovies` plugin-space.
 
@@ -1023,172 +1167,74 @@ def anchovies_import(path: str):
     ```
     '''
     default_exception = BadMagicImport(f'The following magic import could not be found: "{path}".')
+    dynamic_import_exception = None
+    global_import_exception = None
     try: 
         if inspect.isclass(path): 
             return path
-        if not '.' in path: 
-            # this means import from THIS module
+        full_path = f'anchovies.plugins.{path}' if path else 'anchovies.plugins'
+        try: 
+            full_path, cls = '.'.join(full_path.split('.')[:-1]), full_path.split('.')[-1]
+            if cls:
+                module = importlib.import_module(full_path)
+                return getattr(module, cls)
+        except Exception as e: 
+            dynamic_import_exception = e
+        # attempt importing from global
+        try:
             return globals()[path]
-        path, cls = path.split('.')[:-1], path.split('.')[-1]
-        if cls:
-            module = importlib.import_module(f'anchovies.plugins.{path}')
-            return getattr(module, path)
+        except Exception as e: 
+            global_import_exception = e
+        if dynamic_import_exception: 
+            raise dynamic_import_exception
+        if global_import_exception: 
+            raise global_import_exception
     except Exception as e: 
         raise default_exception from e
     raise default_exception
 
 
 REGISTERED_DATASTORES = list()
-FileInfo = namedtuple('FileInfo', ('path', 'modified_on'))
+FileInfo = namedtuple('FileInfo', ('path', 'modified_at', 'size'))
 # TODO: enhance the FileInfo class
 
 
-class Datastore(ABC): 
-    def __init__(self, path, **kwds):
-        super().__init__()
-        self.origpath = path
-
-    @staticmethod
-    def register(cls): 
-        global REGISTERED_DATASTORES
-        if cls not in REGISTERED_DATASTORES: 
-            REGISTERED_DATASTORES.append(cls)
-        return cls
-
-    @staticmethod
-    def meta_list_datastores(): 
-        yield from REGISTERED_DATASTORES
-
-    @classmethod
-    def new(self, path=None, **kwds) -> 'Datastore': 
-        # TODO: cache?
-        if path is None:
-            return FilesystemDatastore()
-        for metastore_cls in self.meta_list_datastores(): 
-            if metastore_cls.is_compatible: 
-                return metastore_cls(path, **kwds)
-        raise AnchovyPluginNotFound(
-            f'There was no metastore registration found matching {path}.\n'
-            'Here are the runtime registrations:\n' + '\n'.join(repr(m) for m in self.meta_list_datastores())
-        )
-
-    @staticmethod
-    @abstractmethod
-    def is_compatible(path): ...
-
-    def open(self, path, mode: Literal['rb', 'wb', 'r', 'w']=None, **kwds) -> io.BufferedRandom:
-        assert mode in {'rb', 'wb', 'r', 'w'}
-        if mode in {'r', 'w'}: 
-            return io.TextIOWrapper(self.openb(path, mode), **kwds)
-        return self.openb(path, mode.replace('b', ''), **kwds)
+class Metastore(ABC): 
+    '''A store that provides some contextual help to Datastore.
     
-    @abstractmethod
-    def openb(self, path, mode: Literal['r', 'w']=None, **kwds) -> io.BytesIO: ...
-
-    def read(self, path) -> str:
-        with self.open(path, 'r') as buf: 
-            return buf.read()
-        
-    def write(self, path, buf: str): 
-        with self.open(path, 'w') as f: 
-            return f.write(buf)
-
-    @abstractmethod
-    def list_files(self, relpathglob=None, *, after=None, before=None): ...
-
-    def list_objs(self, relpathglob=None, *, cls=None, **kwds): 
-        stream = self.list_files(relpathglob, **kwds)
-        stream = map(self.read, stream)
-        stream = map(json.loads, stream)
-        for data in stream:
-            yield cls(**data)
-
-    @abstractmethod
-    def describe(self, relpath) -> FileInfo: ...
-
-    @abstractmethod
-    def delete(self, path) -> None: ...
-
-
-# TODO: move & test
-@Datastore.register
-class FilesystemDatastore(Datastore): 
-    def __init__(self, path: str = None, **kwds):
-        super().__init__(path, **kwds)
-        from pathlib import Path
-        self.aspath = lambda x: Path(self.root_dir, x).expanduser() if x else self.root_dir
-        self.root_dir_abs = Path(self.root_dir).expanduser().absolute()
-
-    @staticmethod
-    def is_compatible(path):
-        if ':' in path:
-            return False
-        try:
-            os.makedirs(path, exist_ok=True)
-            return True
-        except Exception: 
-            return False
-        
-    @property
-    def root_dir(self):
-        return (self.origpath or HOME).strip('/')
-  
-    def openb(self, path, mode, **kwds):
-        mode = mode or 'r'
-        mode += 'b+'
-        path = self.aspath(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return open(path, mode, **kwds)
-
-    def list_files(self, relpathglob=None, *, after=None, before=None):
-        import glob
-        stream = glob.iglob(str(self.aspath(relpathglob)), include_hidden=True)
-        if after: 
-            stream = filter(lambda path: self.st_mtime(path) > after, stream)
-        if before: 
-            stream = filter(lambda path: self.st_mtime(path) <= before, stream)
-        prefix = str(self.root_dir_abs) + '/'
-        stream = map(lambda p: p.removeprefix(prefix), stream)
-        yield from stream
-
-    def st_mtime(self, path): 
-        x = datetime.fromtimestamp(
-            os.stat(path).st_mtime, 
-            dateutil.tz.tzlocal()
-        )
-        return x
-
-    def describe(self, path) -> FileInfo:
-        return FileInfo(path=path, modified_on=self.st_mtime(path))
-
-    def delete(self, path):
-        try: 
-            os.remove(path)
-        except FileNotFoundError: 
-            pass
-
-
-class Metastore: 
-    def __init__(self, *, upstream=(), namespace=None, **kwds):
+    This micro-manages things such as anchovy id & user. Additionally, 
+    sets up microservices from config.
+    '''
+    def __init__(self, *, upstream=(), namespace: str=None, **kwds):
         super().__init__()
-        self.datastore = Datastore.new(METASTORE)
         self._applied_anchovy_user = None
         self._applied_anchovy_id = None
         # want upstream to be easy to control at this level, 
         #   ergo, orphan from session
         self.upstream = upstream or session().upstream or ()
         self.namespace = namespace
-        # TODO: import from settings
-        self.checkpoints = runtime().Checkpoint(self)
-        self.task_store = runtime().TaskStore(self)
-        self.tbl_store = runtime().TblStore(self)
+        # setup checkpoints
+        db = self.make_datastore_for_microservice('checkpoints')
+        self.checkpoints = runtime().Checkpoint(db)
+        # setup task store
+        db = self.make_datastore_for_microservice('task_store')
+        self.task_store = runtime().TaskStore(db)
+        # setup tbl store
+        db = self.make_datastore_for_microservice('tbl_store')
+        self.tbl_store = runtime().TblStore(db)
+        # setup results
+        db = self.make_datastore_for_microservice('result_store')
+        self.result_store = runtime().ResultStore(db)
+        # setup cache
+        db = self.make_datastore_for_microservice('cache')
+        self.cache = runtime().Cache(db)
 
     @property
-    def db(self): 
-        return self.datastore
-    
-    @property
     def anchovy_user(self): 
+        '''Current anchovy user, within the scope of the store.
+        
+        The store's user and the context user _may_ be different.
+        '''
         if self._applied_anchovy_user: 
             return self._applied_anchovy_user
         return context().anchovy_user
@@ -1199,6 +1245,10 @@ class Metastore:
 
     @property
     def anchovy_id(self): 
+        '''Current anchovy id, within the scope of the store.
+        
+        The store's id and the context id _may_ be different.
+        '''
         if self._applied_anchovy_id: 
             return self._applied_anchovy_id
         return context().anchovy_id
@@ -1207,59 +1257,188 @@ class Metastore:
     def anchovy_id(self, user): 
         self._applied_anchovy_id = user
 
-    @property
-    def context_home(self): 
+    def context_home(self, *paths): 
+        '''Return the relative path for the active user.'''
         path = ''
         if self.anchovy_user: 
             path += '/' + self.anchovy_user
-        if self.anchovy_id: 
-            path += '/' + self.anchovy_id
         if not path: 
             raise BrokenConfig('Unplanned scenario')
             #TODO: what should be done when no path?
-        return path.strip('/')
+        return (path.strip('/') + '/' + '/'.join(paths)).strip('/')
+    
+    def anchovy_home(self, *paths): 
+        '''Return the relative path for the active anchovy.'''
+        return self.context_home(self.anchovy_id, *paths)
     
     def connect(self):
-        self.cm_stack = ExitStack().__enter__()
-        enter = self.cm_stack.enter_context
+        '''Open the store & sub services.'''
+        self._exit_stack = ExitStack().__enter__()
+        enter = self._exit_stack.enter_context
         self.checkpoints = enter(self.checkpoints)
         self.task_store = enter(self.task_store)
         self.tbl_store = enter(self.tbl_store)
         return self
     
-    def close(self, *args):
-        self.cm_stack.__exit__(*sys.exc_info())
+    def close(self):
+        '''Disconnect the store & sub services.
+        
+        Subservices frequently use `flush()` methods, 
+        so the main goal is to give them a chance to do so.
+        '''
+        self._exit_stack.__exit__(*sys.exc_info())
 
     def __enter__(self): 
         return self.connect()
     
     def __exit__(self, *args): 
-        self.close(*args)
+        self.close()
 
     def with_(self, **kwds): 
+        '''Clone the metastore, and assign new values.
+        
+        For example: 
+        ```
+        new = metastore.with_(anchovy_id='other_anchovy')
+        ```
+        This opens a metastore viewing a DIFFERENT anchovy.
+        '''
         new = copy(self)
         for k,v in kwds.items(): 
             setattr(new, k, v)
         return new
     
+    def make_datastore_for_microservice(self, id: str): 
+        '''Provided a microservice ID, make or return self based on config.'''
+        config = get_config(f'{id}_datastore')
+        if config is None: 
+            return self
+        return Datastore.new(config)
+    # TODO: cache so connect once
+    #  not doing right now because have to make sure each only 
+    #  gets closed _once_ as well... easier said than done
 
-class SpecificMetastore(ABC): 
-    def __init__(self, metastore: Metastore):
+
+class Datastore(Metastore): 
+    '''A store that manages persistent storage for anchovies.'''
+    def __init__(self, path, **kwds):
+        super().__init__(**kwds)
+        path = path or get_config('datastore', HOME)
+        self.original_path = self.origpath = path
+
+    @staticmethod
+    def register(cls): 
+        '''Add a datastore to the data store registration.'''
+        global REGISTERED_DATASTORES
+        if cls not in REGISTERED_DATASTORES: 
+            REGISTERED_DATASTORES.append(cls)
+        return cls
+
+    @staticmethod
+    def meta_list_datastores(): 
+        '''List registered datastores.'''
+        Plugin.discover()  # force walk of entire directory
+        yield from REGISTERED_DATASTORES
+
+    @classmethod
+    def new(self, path=None, **kwds) -> 'Datastore': 
+        '''Assemble a new Datastore, checking against all plugins
+        based on the Datastore uri.
+        '''
+        # TODO: cache?
+        from anchovies.plugins.core.filesystem import FilesystemDatastore
+        if path is None:
+            return FilesystemDatastore()
+        for metastore_cls in self.meta_list_datastores(): 
+            if metastore_cls.is_compatible(path): 
+                return metastore_cls(path, **kwds)
+        raise AnchovyPluginNotFound(
+            f'There was no metastore registration found matching {path}.\n'
+            'Here are the runtime registrations:\n' + '\n'.join(repr(m) for m in self.meta_list_datastores())
+        )
+
+    @staticmethod
+    @abstractmethod
+    def is_compatible(path): 
+        '''Check a path for compatibility.'''
+        ...
+
+    def open(self, path, mode: Literal['rb', 'wb', 'r', 'w']=None, **kwds) -> io.BufferedRandom:
+        '''Open a read/write stream on a file, potentially in text mode.'''
+        mode = mode or 'r'
+        assert mode in {'rb', 'wb', 'r', 'w'}
+        if mode in {'r', 'w'}: 
+            return io.TextIOWrapper(self.openb(path, mode), **kwds)
+        return self.openb(path, mode.replace('b', ''), **kwds)
+    
+    @abstractmethod
+    def openb(self, path, mode: Literal['r', 'w']=None, **kwds) -> io.BytesIO:
+        '''Open a read or write stream on a file, strictly in binary mode.'''
+        ...
+
+    def read(self, path) -> str:
+        '''Call `read()` on an underlying file.'''
+        with self.open(path, 'r') as buf: 
+            return buf.read()
+        
+    def write(self, path, buf: str): 
+        '''Call `write()` on an underlying file.'''
+        with self.open(path, 'w') as f: 
+            return f.write(buf)
+
+    @abstractmethod
+    def list_files(self, relpathglob=None, *, after=None, before=None):
+        '''Iterate through matching file names, optionally filtering 
+        by modification time.
+        '''
+        ...
+
+    def list_objs(self, relpathglob=None, *, cls=None, **kwds): 
+        '''Wrapper on `list_files()` allowing consistent serialization of objects.'''
+        stream = self.list_files(relpathglob, **kwds)
+        stream = map(self.read, stream)
+        stream = map(json.loads, stream)
+        for data in stream:
+            yield cls(**data)
+
+    @abstractmethod
+    def describe(self, relpath) -> FileInfo:
+        '''Describe the matching file.'''
+        ...
+
+    @abstractmethod
+    def delete(self, path) -> None:
+        '''Delete the file (if it exists).'''
+        ...
+
+
+class Microservice(ABC):
+    '''An anchovies construct that helps with persistent storage
+    on a particular facet of anchovies data.
+    ''' 
+    def __init__(self, db: Datastore):
         super().__init__()
-        self.metastore = metastore
-
-    @property 
-    def db(self): 
-        return self.metastore.db
+        self.db = db
 
 
-class BaseCheckpoint(SpecificMetastore): 
-    def __init__(self, metastore: Metastore):
-        super().__init__(metastore=metastore)
+class BaseCheckpoint(Microservice): 
+    '''Keep & maintain checkpoints on your anchovies.
+    
+    Usage: 
+    ```
+    ts = context().checkpoint[tbl, 'last.timestamp']
+    client.query(after=ts)
+    ...
+    context().checkpoint[tbl, 'last.timestamp'] = new_ts
+    ```
+    '''
+    def __init__(self, db):
+        super().__init__(db)
         self.ser_hints = dict()
         self.des_hints = dict()
     
     def open(self): 
+        '''Allow context-handling.'''
         pass
 
     def close(self): 
@@ -1273,6 +1452,7 @@ class BaseCheckpoint(SpecificMetastore):
         self.close()
 
     def hint(self, key, *, ser: Callable=None, des: Callable=None): 
+        '''Provide a type hint (and ser/des) for a string pattern of key.'''
         if ser: # SERIALIZE TO TEXT
             self.ser_hints[key] = ser
         if des: # DESERIALIZE FROM TEXT
@@ -1280,6 +1460,7 @@ class BaseCheckpoint(SpecificMetastore):
 
     @staticmethod
     def get_serdes(serdes: dict, key: str) -> Callable: 
+        '''Find matching serdes.'''
         if ser := serdes.get(key): 
             return ser
         for pat, ser in serdes.items(): 
@@ -1287,40 +1468,56 @@ class BaseCheckpoint(SpecificMetastore):
                 return ser
         return lambda x: x # do nothing
         
-    def get_ser(self, key): 
+    def get_ser(self, key):
+        '''Get a serializer for a given key.''' 
         return self.get_serdes(self.ser_hints, key)
     
     def get_des(self, key): 
+        '''Get a deserializer for a given key.''' 
         return self.get_serdes(self.des_hints, key)
 
     @abstractmethod
-    def items(self) -> Iterator[tuple[str, str]]: ...
+    def items(self) -> Iterator[tuple[str, str]]: 
+        '''Iterate through all items in the checkpoint store.'''
+        ...
 
     @abstractmethod
-    def get(self, key: str, *, strict=False): ...
+    def get(self, key: str | Sequence, *, strict=False): 
+        '''Get a specific checkpoint by key.'''
+        ...
 
     @abstractmethod
-    def put(self, key: str, data: str): ...
+    def put(self, key: str, data: str):
+        '''Update a specific checkpoint by key.'''
+        ...
 
     def desget(self, key, **kwds):
+        '''Get a specific checkpoint & deserialize.'''
         des = self.get_des(key)
         return des(self.get(key, **kwds))
     
     def serput(self, key, data, **kwds): 
+        '''Update a specific checkpoint & serialize.'''
         ser = self.get_ser(key)
         return self.put(key, ser(data), **kwds)
 
     def __getitem__(self, key):
+        '''Get a specific checkpoint & deserialize.'''
+        if not isinstance(key, str): 
+            key = '.'.join(key)
         return self.desget(key)
     
     def __setitem__(self, key, data): 
+        '''Update a specific checkpoint & serialize.'''
         return self.serput(key, data)
 
     def as_path(self, key: str): 
-        return f'{self.metastore.context_home}/$checkpoints/{key}'
+        '''Return the path for a particular checkpoint.'''
+        return self.db.anchovy_home('$checkpoints', key)
     
     def from_path(self, path: str): 
-        return path.removeprefix(f'{self.metastore.context_home}/$checkpoints/')
+        '''Parse the path for a particular checkpoint.'''
+        return path.removeprefix(self.db.anchovy_home('$checkpoints'))
 
 
 class Checkpoint(BaseCheckpoint):     
@@ -1341,8 +1538,8 @@ class Checkpoint(BaseCheckpoint):
     
 
 class CachedCheckpoint(Checkpoint): 
-    def __init__(self, metastore):
-        super().__init__(metastore)
+    def __init__(self, db):
+        super().__init__(db)
         self.cached = False
         self.data = dict()
         self._changed = set()
@@ -1389,7 +1586,7 @@ class CachedCheckpoint(Checkpoint):
         )
 
 
-class TaskStore(SpecificMetastore):
+class TaskStore(Microservice):
     """
     Help store & manage task log instances.
 
@@ -1402,16 +1599,18 @@ class TaskStore(SpecificMetastore):
         # where results is some kind of "results tuple" or set of information
     ```
     """
-    def __init__(self, metastore: Metastore):
-        super().__init__(metastore=metastore)
+    def __init__(self, db):
+        super().__init__(db)
         self._cvtoken = None
         self._log_num = 0
-        self._mutex = th.Lock() # TODO: does this need to be gevent?
+        self._lock = th.Lock() # TODO: does this need to be gevent?
 
     def open(self): 
+        '''Connect to the task store.'''
         self._cvtoken = OPEN_TASK_STORE.set(self)
 
     def close(self): 
+        '''Disconnect from the task store.'''
         if self._cvtoken:
             OPEN_TASK_STORE.reset(self._cvtoken)
 
@@ -1428,28 +1627,19 @@ class TaskStore(SpecificMetastore):
         self.db.write(path, task.dump())
 
     def new_path(self, key=None):
-        with self._mutex:
+        '''Generate a new path like `$task_logs/YYYmmdd<...>.json`.'''
+        with self._lock:
             key = key or context().batch_guid + '.' + str(self._log_num).zfill(4)
             self._log_num += 1
-            return f'{self.metastore.context_home}/$task_logs/{key}.json'
+            return self.db.anchovy_home('$task_logs', f'{key}.json')
 
 
 OPEN_TASK_STORE = cvar.ContextVar('OPEN_TASK_STORE')
 # no default instance :(
 
 
-class AnchoviesEncoder(json.JSONEncoder): 
-    def default(self, o):
-        if isinstance(o, datetime): 
-            return o.isoformat()
-        if isinstance(o, Tbl): 
-            return str(o)
-        return super().default(o)
-
-
 TaskTypeT = Literal['STARTUP', 'XOPEN', 'TABLE', 'XCLOSE', 'ERROR', 'SHUTDOWN']
 ExecStatusT = Literal['OK', 'ERR']
-TASK = cvar.ContextVar('TASK')
 class Task: 
     '''
     Execution of an arbitrary datum of work within anchovies.
@@ -1485,6 +1675,7 @@ class Task:
         self.status = status
         self.apply_defaults()
         self._ctoken = None
+        self._lock = th.Lock() # TODO: does this need to be gevent lock???
 
     def __str__(self): 
         label = str(self.task_type)
@@ -1498,7 +1689,7 @@ class Task:
     def __exit__(self, exctype, *args): 
         self.send()
         if exctype and issubclass(exctype, Exception): 
-            if EXECUTION_POLICY == 'UNSAFE':
+            if session().batch_policy == 'CONTINUE':
                 # this surpresses the error if it's not a shutdown
                 return True
 
@@ -1538,20 +1729,29 @@ class Task:
             self.task_type = 'TABLE'
 
     def start(self):
+        '''Start a task for monitoring.'''
         self.started_at = now()
         debug(f'start task {self} @ {self.started_at.isoformat()}')
-        self._ctoken = TASK.set(self)
         return self
 
     def send(self):
+        '''Record the task to the task store.
+        
+        This also "finalizes" the Task record by compiling it 
+        correctly for serialization, such as adding timestamps
+        & checking for errors.
+        '''
+        op = session().maybe_make_operator()
+        for callback in op.task_callbacks.for_task(self.task_type):
+            try:
+                callback(task=self)
+            except Exception as e: 
+                raise TaskCallbackFailedWarning(e) from e
+                # TODO: will this suffice
         try:
-            #TODO: run callbacks scheduled thru task decorator
-            # self.run_callbacks()
             self.completed_at = now()
             if context().batch_id and not self.batch_id: 
                 self.batch_id = context().batch_id
-            if self._ctoken: 
-                TASK.reset(self._ctoken)
             self.maybe_convert_to_exception()
             if not self.duration: 
                 self.duration = round((self.completed_at - self.timestamp).total_seconds() * 1000)
@@ -1589,7 +1789,7 @@ class Task:
             session().shutdown_task = self
         batch().add_done_task(self)
 
-    def with_(self, data: object | dict | list | str): 
+    def with_(self, data: object | dict | list | str = None, **kwds): 
         '''Add data to the dynamic `data` attribute of the task log.'''
         if isinstance(data, Exception): 
             data = {
@@ -1603,9 +1803,14 @@ class Task:
                     and not k.startswith('_')
             }
             data = new
-        if not self.data: 
-            self.data = {}
-        self.data.update(data)
+        if kwds: 
+            if not data:  
+                data = dict()
+            data.update(**kwds)
+        with self._lock: 
+            if not self.data: 
+                self.data = {}
+            self.data.update(data)
         return data
 
     def info(self): 
@@ -1643,11 +1848,6 @@ class Task:
         return json.dumps(info, default=AnchoviesEncoder().default)
 
 
-def task(): 
-    '''Magic method to get the open Task instance.'''
-    return TASK.get()
-
-
 def as_task(*task_args, capture=True, **task_kwds): 
     '''
     A helper function to make 
@@ -1661,6 +1861,8 @@ def as_task(*task_args, capture=True, **task_kwds):
         def wrapper(*args, **kwds): 
             res = None
             with Task.allowing_overflow(*task_args, **task_kwds) as task:
+                if task.task_type == 'TBL': 
+                    kwds['task'] = task
                 res = callable(*args, **kwds)
                 if capture: 
                     task.with_(res)
@@ -1674,11 +1876,75 @@ def as_task(*task_args, capture=True, **task_kwds):
     return decorator
 
 
-class TblStore(SpecificMetastore):
-    '''Persistent storage of `Tbl` constructs.'''
-    def __init__(self, metastore: Metastore):
-        super().__init__(metastore=metastore)
+def on_task(task_name: TaskTypeT): 
+    '''Schedule a callback to be executed AFTER a task completes.
+    
+    Usage: 
+    ```
+    class CustomDownloader(Downloader): 
+        @on_task('XOPEN')
+        def do_at_start(self): 
+            ...
+    ```
+    '''
+    def decorator(func): 
+        return TaskCallback(task_name, func)
+    return decorator
 
+
+class TaskCallback: 
+    '''When a task completes, callback to the function mentioned here.'''
+    def __init__(self, task_name: TaskTypeT, func: Callable):
+        self.task_name = task_name
+        self.func = func
+        self.guide: TaskGuide = None
+
+    def make_method(self, operator: Operator): 
+        method = MethodType(self.func, operator)
+        self.save_runtime_method(operator, method)
+        return method
+
+    def save_runtime_method(self, op, meth): 
+        self.operator = op
+        self.runtime_method = meth
+
+    def __call__(self, *args, **kwds):
+        func = self.func
+        if self.runtime_method: 
+            func = self.runtime_method
+        return func(*args, **kwds)
+
+
+class TaskGuide:
+    '''Create a manager to correctly setup task callbacks for an
+    Operator.
+    ''' 
+    def __init__(self, op: Operator):
+        self.op = Operator
+        for attr, task in inspect.getmembers(self.op): 
+            if isinstance(task, TaskCallback): 
+                self.save_task(task)
+                setattr(self.op, attr, task.make_method(self.op))
+        self.tasks = set()
+        self.task_map = dict()
+
+    def save_task(self, task: TaskCallback): 
+        '''Record a decorated task to the bank.'''
+        if task in self.tasks: 
+            return
+        task.guide = self
+        self.tasks.add(task)
+        if task.task_name not in self.task_map: 
+            self.task_map[task.task_name] = list()
+        self.task_map[task.task_name].append(task)
+
+    def for_task(self, task_type: TaskTypeT): 
+        '''Return matching callbacks for a specific task type.'''
+        return self.task_map.get(task_type) or ()
+    
+
+class TblStore(Microservice):
+    '''Persistent storage of `Tbl` constructs.'''
     def __iter__(self): 
         yield from self.tbls.values()
 
@@ -1689,6 +1955,7 @@ class TblStore(SpecificMetastore):
         return self.flush()
 
     def open(self):
+        '''Connect to the TblStore.'''
         tbls = self.read_upstream()
         # tbls = tbls.merge(self.read_db())
         tbls = tbls.merge(self.read_config())
@@ -1696,27 +1963,26 @@ class TblStore(SpecificMetastore):
         return self
     
     def flush(self):
+        '''Save all pending tbls.'''
         for tbl in self: 
             self.save(tbl)
 
     def save(self, tbl: Tbl): 
+        '''Save a specific Tbl to Datastore.'''
         path = self.new_path(tbl)
         self.db.write(path, tbl.dump())
 
     def new_path(self, tbl: Tbl): 
         '''`$HOME/user/id/$tables/<< qualified table name >>.json`'''
-        if isinstance(tbl, str): 
-            return f'{self.metastore.context_home}/$tables/{tbl}.json'
-        return f'{self.metastore.context_home}/$tables/{tbl.savename}.json'
-    # TODO: how does name qualification work in uploaders......
+        return self.db.anchovy_home('$tables', f'{tbl}.json')
 
     # @memoize
     def read_upstream(self): 
         '''Check "upstream" anchovies for configured tables.'''
         tbls = TblSet()
-        upstream = self.metastore.upstream
+        upstream = self.db.upstream
         metas = map(
-            lambda achvy: self.metastore.with_(
+            lambda achvy: self.db.with_(
                 anchovy_id=achvy,
                 namespace=achvy,
                 upstream=(),
@@ -1735,9 +2001,11 @@ class TblStore(SpecificMetastore):
         read the filesystem/metastore.
         '''
         tbls = TblSet()
-        for tbl in self.db.list_objs(self.new_path('*'), cls=Tbl):
+        cls = runtime().Tbl.from_namespace(self.db.anchovy_id)
+        for tbl in self.db.list_objs(self.new_path('*'), cls=cls): 
+            # ??? need this to somehow know which anchovy it came from
             if not tbl.namespace:
-                tbl.namespace = self.metastore.namespace
+                tbl.namespace = self.db.namespace
             tbls.add(tbl)
         return tbls
 
@@ -1755,44 +2023,75 @@ class TblStore(SpecificMetastore):
         return tbls
 
 
-def get_config(setting_name: str, default=None, /, astype: type=None): 
+class Cache(Microservice): 
+    '''Provide an internal methodology for doing TTL caching.
+    
+    Because the ultimate goal of anchovies is building long-running
+    services, caching could be helpful/allow more intuitive programming.
+    For example, consider the base SQL Uploader: it checks for modified 
+    file paths in the BATCH OPEN task **and** once for each table. 
+    If this is naturally cached, then we've used one less round trip against
+    object storage.
     '''
-    Scan both the Environment & Session for configs/settings. This
-    will always return a str, UNLESS you use the `astype` arg, which 
-    will safely attempt to convert the value.
-    When the Environment & Session both have a value, the Session wins.
+    def __init__(self, db):
+        super().__init__(db)
+        self._prefixes = dict()
+
+    def get(self, key: str, *, key_prefix: str=None) -> Any:
+        return self.check_ttl(self.prefix(key_prefix).get(key))
+
+    def get_or_set(self, key: str, value: Any=None, *, key_prefix: str=None, ttl: int=-1) -> Any:
+        '''Set a value in the cache and retrieve.'''
+        self.prefix(key_prefix)[key] = self.add_ttl(value, ttl)
+        return value
+    
+    def prefix(self, key_prefix: str): 
+        '''Get a key prefix db.'''
+        if key_prefix not in self._prefixes:
+            self._prefixes[key_prefix] = dict()
+        return self._prefixes.get(key_prefix)
+    
+    def check_ttl(self, value: tuple[Any, int]): 
+        '''Check the expires at property.'''
+        if value is None: 
+            return None
+        if value[1] and value[1] > time.time(): 
+            return None
+        debug(f'cache hit! {value} expiring in {time.time() - value[1]}')
+        return value[0]
+    
+    def add_ttl(self, value, ttl):
+        '''Add an expires at property.''' 
+        expires_at = None
+        if ttl > -1: 
+            expires_at = time.time() + ttl
+        return (value, expires_at)
+    
+    def make_key(self, *args, **kwds): 
+        named_args = tuple((k, v) for k,v in kwds.items())
+        return hash((*args, *named_args))
+
+
+class ResultStore(Microservice): 
+    '''Dump session results & provide access for anchovies to the same
+    with potentially source specific results files. 
     '''
-    from_env = getenv(setting_name.upper())
-    from_ses = None
-    if session():
-        from_ses = session().config.get(setting_name)
-    setting = from_ses if from_ses else from_env
-    if setting and astype is not None: 
-        try: 
-            return astype(setting)
-        except Exception as e: 
-            raise BadEnvironmentVariable(f'Could not cast {setting} from {setting_name} to {astype}.') \
-                from e
-    return setting or default
+    def dump(self, path, data: dict | list | str): 
+        '''Commit a results file.'''
+        if isinstance(data, (dict, list, tuple)): 
+            data = json.dumps(data)
+        self.db.write(self.qualified(path), data)
 
-
-def tuple_from_str(comma_sep_str: str) -> Sequence[str]: 
-    if comma_sep_str and not isinstance(comma_sep_str, str):
-        return tuple(comma_sep_str)
-    if comma_sep_str: 
-        return tuple(x.strip() for x in comma_sep_str.split(','))
-    return ()
-
-
-def bool_from_str(bool_str: str) -> bool: 
-    if isinstance(bool_str, bool): 
-        return bool_str
-    if not bool_str.strip(): 
-        return False
-    return bool_str[0].upper() == 'T' or bool_str[0].upper() == 'Y'
+    def qualified(self, path: str): 
+        '''`$HOME/$user/$id/$results/<path>`'''
+        return self.db.anchovy_home('$results', path)
+    
+    def __setitem__(self, path: str, data): 
+        return self.dump(path, data)
 
 
 class BaseContext: 
+    '''Common ancestor context class for Session & Batch.'''
     def __init__(
         self, 
         operator_cls: type[Downloader], 
@@ -1857,10 +2156,6 @@ class BaseContext:
             batch_id = ses._last_batch_id + 1
         return str(batch_id).zfill(3)
     
-    # @property
-    # def worker_id(self): 
-    #     return self._worker_id
-    
     def task_store(self): 
         try: 
             return OPEN_TASK_STORE.get()
@@ -1893,7 +2188,7 @@ class Session(BaseContext):
         self.is_task_executor = get_config('is_task_executor', True, astype=bool_from_str)
         # helpers
         self.connections: ConnectionFairy | None = None
-        self.metastore: Metastore | None = None
+        self.datastore: Datastore | None = None
         self._session_id = self.new_session_id()
         self._operator = None
         self.batches: list[Batch] = list()
@@ -1902,6 +2197,7 @@ class Session(BaseContext):
         self.shutdown_at: datetime | None = None
         self.shutdown_task: Task | None=None
         self.execution_timeout: float = get_config('execution_timeout', astype=float)
+        self.batch_policy: Literal['CONTINUE', 'RAISE'] = get_config('batch_policy', 'CONTINUE')
 
     def __repr__(self):
         return f'Session-{self.session_id}'
@@ -1930,11 +2226,15 @@ class Session(BaseContext):
         return as_task(self.actually_startup, task_type='STARTUP', capture=False)()
     
     def actually_startup(self): 
+        info('')
+        info('𓆝 𓆟 𓆞 𓆟 𓆝 '*8)
+        info('𓆟 𓆝 𓆝 𓆟 𓆞 '*8)
+        info('')
         info(f'starting up {self} (STARTUP)...')
         self.startup_at = now()
-        if not self.metastore:
-            self.metastore = runtime().Metastore(**self.dump())
-            self.metastore.connect()
+        if not self.datastore:
+            self.datastore = Datastore.new(**self.dump())
+            self.datastore.connect()
         op = self.maybe_make_operator() # should this receive args?
         self.connections = ConnectionFairy(op)
         self.connections.connect()
@@ -1946,7 +2246,8 @@ class Session(BaseContext):
 
     def shutdown(self): 
         as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
-        self.metastore.close()
+        self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
+        self.datastore.close()
         SESSION.reset(self._session_token)
         CONTEXT.reset(self._context_token)
 
@@ -2073,7 +2374,7 @@ class Batch(BaseContext):
         self._context_token = None
         self._batch_token = None
         self.done_tasks: list[Task] = list()
-        self._mutex = th.Lock()
+        self._lock = th.Lock()
     
     @property
     def operator_cls(self): 
@@ -2145,7 +2446,7 @@ class Batch(BaseContext):
     def error(self): ...
 
     def add_done_task(self, task: Task): 
-        with self._mutex: 
+        with self._lock: 
             self.done_tasks.append(task)
 
     def slim_info(self): 
@@ -2192,10 +2493,20 @@ class runtime:
         self.Tbl: type[Session] = import_runtime_from_config('tbl_cls', Tbl)
         self.Session: type[Session] = import_runtime_from_config('session_cls', Session)
         self.Batch: type[Batch] = import_runtime_from_config('batch_cls', Batch)
-        self.Metastore: type[Metastore] = import_runtime_from_config('metastore_cls', Metastore)
         self.Checkpoint: type[Checkpoint] = import_runtime_from_config('checkpoint_cls', Checkpoint)
         self.TaskStore: type[TaskStore] = import_runtime_from_config('task_store_cls', TaskStore)
         self.Task: type[Task] = import_runtime_from_config('task_cls', Task)
         self.TblStore: type[TblStore] = import_runtime_from_config('tbl_store_cls', TblStore)
-        from anchovies.plugins.core.io import DataBuffer
-        self.DataBuffer: type[DataBuffer] = import_runtime_from_config('data_buffer_cls', DataBuffer)
+        self.ResultStore: type[ResultStore] = import_runtime_from_config('result_store_cls', ResultStore)
+        self.Cache: type[Cache] = import_runtime_from_config('cache', Cache)
+        from anchovies.plugins.core.io import DefaultDataBuffer
+        self.DataBuffer: type[DefaultDataBuffer] = import_runtime_from_config('data_buffer_cls', DefaultDataBuffer)
+
+
+class AnchoviesEncoder(json.JSONEncoder): 
+    def default(self, o):
+        if isinstance(o, datetime): 
+            return o.isoformat()
+        if isinstance(o, Tbl): 
+            return str(o)
+        return super().default(o)

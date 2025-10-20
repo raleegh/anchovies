@@ -1,6 +1,6 @@
 import datetime as dt
 from pytest import fixture
-from anchovies.sdk import FilesystemDatastore as Ds
+from anchovies.plugins.core.filesystem import FilesystemDatastore as Ds
 
 
 @fixture

@@ -1,5 +1,5 @@
 from pytest import fixture
-from anchovies.sdk import Downloader, Session, Metastore, TblStore, ID
+from anchovies.sdk import Downloader, Session, Datastore, TblStore
 
 
 @fixture
@@ -11,11 +11,11 @@ def tblstore(newmeta):
 @fixture
 def setup_multiple(newmeta, config_str): 
     with Session(Downloader, anchovy_id='anchovy1', config_str=config_str) as ses, \
-            Metastore():
+            Datastore.new():
         with TblStore(newmeta) as tbls:
             pass
     with Session(Downloader, anchovy_id='anchovy2', config_str=config_str) as ses, \
-            Metastore():
+            Datastore.new():
         with TblStore(newmeta) as tbls:
             pass
     with Session(
@@ -23,7 +23,7 @@ def setup_multiple(newmeta, config_str):
         anchovy_id='anchovy3',
         upstream=('anchovy1', 'anchovy2'),
     ) as ses, \
-            Metastore() as meta:
+            Datastore.new() as meta:
         yield meta
 
 
@@ -37,8 +37,8 @@ def test_read(session, tblstore):
 
 def test_save(tblstore, newmeta): 
     tblstore.flush()
-    db = newmeta.db
-    files = list(db.list_files(newmeta.context_home + '/$tables/*'))
+    db = newmeta
+    files = list(db.list_files(newmeta.anchovy_home('$tables', '*')))
     assert files
 
 
@@ -46,4 +46,5 @@ def test_downstream_read(setup_multiple):
     '''Test that a "downstream" anchovy can read files from "upstream anchovy.'''
     meta = setup_multiple
     with TblStore(meta) as tbls: 
-        assert list(tbls)
+        tbls = list(tbls)
+    assert len(tbls) >= 4, 'There should be 4 tbls generated.'
