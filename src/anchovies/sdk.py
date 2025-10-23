@@ -1069,7 +1069,7 @@ class ConnectionFairy:
         for id, memo in self.ids.items(): 
             if memo.disconnected: 
                 continue
-            if cnxn := self.data.get(id):
+            if cnxn := self.get_or_set(id):
                 self.attach(id, connect(cnxn))
         return self
     
