@@ -19,6 +19,7 @@ from types import SimpleNamespace, ModuleType, MethodType
 from typing import cast, Any, Literal, Iterator, Callable, Sequence
 from functools import cache as memoize
 from functools import cached_property as memoprop
+from functools import partial
 from datetime import datetime, UTC
 from copy import copy, deepcopy
 
@@ -548,7 +549,7 @@ class Stream:
             tbl_name = started_by.tbl_wildcard
         if not tbl_name:
             tbl_name = self.tbl_wildcard
-        kwds = {'stream': self._stream, 'tbl': runtime().Tbl(tbl_name), **kwds}
+        kwds = dict(stream=self._stream, tbl=runtime().Tbl(tbl_name), **kwds)
         # TODO: consider passing self as stream...
         if not wrapped_by: 
             return self.actually_run_as_stream(**kwds)
@@ -2505,7 +2506,7 @@ class Batch(BaseContext):
         op = session().maybe_make_operator()
         tbls = op.discover_tbls()  # TODO: cache discover tables?
         tbls = self.tbls = session().select_tables(tbls)
-        op.run_streams(tbls, wrapped_by=as_task)
+        op.run_streams(tbls, wrapped_by=partial(as_task, task_type='TBL'))
 
     def open(self):
         return as_task(self.actually_open, task_type='XOPEN', capture=False)()
