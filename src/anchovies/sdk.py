@@ -11,6 +11,7 @@ import logging
 import logging.config
 import importlib
 import time
+import atexit
 from abc import ABC, abstractmethod
 from collections import UserDict, UserList, namedtuple
 from contextlib import ExitStack
@@ -144,14 +145,7 @@ BATCH = cvar.ContextVar('BATCH', default=None)
 
 
 logger = logging.getLogger('anchovies')
-logger.setLevel(logging.INFO)
-logging.basicConfig(
-    level=logging.CRITICAL,
-    format='%(asctime)s %(levelname)s %(message)s -- (%(name)s)',
-)
 LOGGING_CONFIG_FILE = getenv('LOGGING_CONFIG_FILE')
-if LOGGING_CONFIG_FILE: 
-    logging.config.fileConfig(LOGGING_CONFIG_FILE)
 info = logger.info
 debug = logger.debug
 
@@ -1091,8 +1085,12 @@ class ConnectionFairy:
 class Anchovy:
     '''A single executor.'''
     def __init__(self, id: str=None, user: str=None): 
-        self.id = id or f'{HOST}:{PORT}'
-        self.user = user or self.default_username()
+        self.id = id or ID or f'{HOST}:{PORT}'
+        self.user = user or USER or self.default_username()
+        self._session = None
+
+    def __str__(self): 
+        return f'Anchovy({self.user}/{self.id})'
 
     @staticmethod
     def default_username(): 
@@ -1124,6 +1122,28 @@ class Anchovy:
             results = ses.results()
         return results, exception
 
+    def list_checkpoints(self, path_or_glob, operator_cls=Downloader, **session_kwds): 
+        '''Find associated checkpoints & list them.
+        
+        Assuming invoked by application, so therefore: starting
+        an InteractiveSession and moving right along.
+        '''
+        ses = self.make_interactive_session(operator_cls, **session_kwds) # TODO: would like this cleaner
+        yield from ses.datastore.checkpoints.find(path_or_glob)
+
+    def delete_checkpoints(self, path_or_glob, operator_cls=Downloader, **session_kwds): 
+        '''Remove a single checkpoint for an anchovy.'''
+        ses = self.make_interactive_session(operator_cls, **session_kwds)
+        keys = tuple(dict(ses.datastore.checkpoints.find(path_or_glob)))
+        for key in keys:
+            ses.datastore.checkpoints.remove(key)
+
+    def make_interactive_session(self, operator_cls, **session_kwds) -> 'InteractiveSession': 
+        if self._session: 
+            return session()
+        ses = self._session = InteractiveSession(operator_cls, self, **session_kwds)
+        ses.startup()
+        return ses
 
 class Plugin: 
     '''A plugin module from `anchovies.plugins`.
@@ -1481,6 +1501,12 @@ class BaseCheckpoint(Microservice):
         '''Iterate through all items in the checkpoint store.'''
         ...
 
+    def find(self, path_or_glob: str) -> Iterator[tuple[str, str]]: 
+        '''Call against `.items()` and filter by pattern matching on key.'''
+        for key, value in self.items(): 
+            if fnmatch.fnmatch(key, path_or_glob): 
+                yield key, value
+
     @abstractmethod
     def get(self, key: str | Sequence, *, strict=False): 
         '''Get a specific checkpoint by key.'''
@@ -1489,6 +1515,11 @@ class BaseCheckpoint(Microservice):
     @abstractmethod
     def put(self, key: str, data: str):
         '''Update a specific checkpoint by key.'''
+        ...
+
+    @abstractmethod
+    def remove(self, key: str): 
+        '''Remove a specific key'''
         ...
 
     def desget(self, key, **kwds):
@@ -1517,11 +1548,12 @@ class BaseCheckpoint(Microservice):
     
     def from_path(self, path: str): 
         '''Parse the path for a particular checkpoint.'''
-        return path.removeprefix(self.db.anchovy_home('$checkpoints'))
+        return path.removeprefix(self.db.anchovy_home('$checkpoints') + '/')
 
 
 class Checkpoint(BaseCheckpoint):     
     def items(self):
+        debug(f'read checkpoints at {self.as_path("*")}')
         for path in self.db.list_files(self.as_path('*')): 
             yield self.from_path(path), self.db.read(path)
 
@@ -1536,6 +1568,9 @@ class Checkpoint(BaseCheckpoint):
     def put(self, key, data): 
         return self.db.write(self.as_path(key), data)
     
+    def remove(self, key): 
+        self.db.delete(self.as_path(key))
+    
 
 class CachedCheckpoint(Checkpoint): 
     def __init__(self, db):
@@ -1547,8 +1582,7 @@ class CachedCheckpoint(Checkpoint):
     def maybe_cache(self): 
         if self.cached: 
             return
-        for k, v in super().items(): 
-            self.data[k] = v
+        self.data = dict(super().items())
         self.cached = True
 
     def flush(self):
@@ -1565,6 +1599,11 @@ class CachedCheckpoint(Checkpoint):
     def put(self, key, data): 
         self.data[key] = data
         self._changed.add(key)
+
+    def remove(self, key):
+        if key in self.data:
+            del self.data[key]
+        return super().remove(key)
 
     def items(self): 
         return self.data.items()
@@ -2166,7 +2205,8 @@ class BaseContext:
             )
     
 
-class Session(BaseContext): 
+class InteractiveSession(BaseContext): 
+    '''A Session instance used by the CLI.'''
     def __init__(
         self, 
         operator_cls, 
@@ -2192,15 +2232,28 @@ class Session(BaseContext):
         self._session_id = self.new_session_id()
         self._operator = None
         self.batches: list[Batch] = list()
+        self.has_started = False
+        self.has_shutdown = False
         self.startup_at: datetime | None = None
         self.startup_task: Task | None = None
         self.shutdown_at: datetime | None = None
         self.shutdown_task: Task | None=None
         self.execution_timeout: float = get_config('execution_timeout', astype=float)
         self.batch_policy: Literal['CONTINUE', 'RAISE'] = get_config('batch_policy', 'CONTINUE')
+        self.log_level = log_level = get_config('log_level', 'INFO')
+        log_level_num = getattr(logging, log_level)
+        assert log_level_num, f'Could not find "{log_level}" in logging module.'
+        logging.basicConfig(
+            level=logging.CRITICAL,
+            format='%(asctime)s %(levelname)s %(message)s -- (%(name)s)',
+        )
+        if LOGGING_CONFIG_FILE: 
+            logging.config.fileConfig(LOGGING_CONFIG_FILE)
+        logger.setLevel(log_level_num)
+        self._lock = th.Lock()
 
     def __repr__(self):
-        return f'Session-{self.session_id}'
+        return f'{type(self).__name__}-{self.session_id}'
 
     @memoprop
     def config_yaml(self) -> dict: 
@@ -2223,38 +2276,31 @@ class Session(BaseContext):
         return datetime.now(UTC).strftime('%Y%m%d%H%M%S')
 
     def startup(self): 
-        return as_task(self.actually_startup, task_type='STARTUP', capture=False)()
-    
-    def actually_startup(self): 
-        info('')
-        info('𓆝 𓆟 𓆞 𓆟 𓆝 '*8)
-        info('𓆟 𓆝 𓆝 𓆟 𓆞 '*8)
-        info('')
-        info(f'starting up {self} (STARTUP)...')
-        self.startup_at = now()
+        if self.has_started: 
+            return self
+        op = self.maybe_make_operator() # should this receive args?
         if not self.datastore:
             self.datastore = Datastore.new(**self.dump())
             self.datastore.connect()
-        op = self.maybe_make_operator() # should this receive args?
-        self.connections = ConnectionFairy(op)
-        self.connections.connect()
-        return self
-    
+        atexit.register(self.garbage_collection_hook)
+        self.has_started = True
+   
+    def garbage_collection_hook(self, *args, **kwds): 
+        self.shutdown()
+
     def start_context(self): 
         self._session_token = SESSION.set(self)
         self._context_token = CONTEXT.set(self)
 
-    def shutdown(self): 
-        as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
-        self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
-        self.datastore.close()
+    def shutdown(self):
+        if self.has_shutdown: 
+            return
+        debug(f'Shutdown session {self}')
         SESSION.reset(self._session_token)
         CONTEXT.reset(self._context_token)
-
-    def actually_shutdown(self):
-        info(f'shutting down {self} (SHUTDOWN)...')
-        self.shutdown_at = now()
-        self.connections.close()
+        self._session_token, self._context_token = None, None
+        self.datastore.close() # should this be closed?
+        self.has_shutdown = True
 
     def __enter__(self) -> 'Session': 
         return self.startup()
@@ -2311,6 +2357,45 @@ class Session(BaseContext):
     
     def results(self): 
         return SessionResult(self)
+    
+
+class RuntimeSession(InteractiveSession): 
+    '''A session instance used by the `anchovy run` command.'''
+    def startup(self):
+        return as_task(self.actually_startup, task_type='STARTUP', capture=False)() 
+    
+    def actually_startup(self): 
+        if self.has_started: 
+            return self
+        info('')
+        info('𓆝 𓆟 𓆞 𓆟 𓆝 '*8)
+        info('𓆟 𓆝 𓆝 𓆟 𓆞 '*8)
+        info('')
+        info(f'starting up {self} (STARTUP)...')
+        self.startup_at = now()
+        if not self.datastore:
+            self.datastore = Datastore.new(**self.dump())
+            self.datastore.connect()
+        op = self.maybe_make_operator() # should this receive args?
+        self.connections = ConnectionFairy(op)
+        self.connections.connect()
+        self.has_started = True
+        return self
+      
+    def shutdown(self): 
+        if self.has_shutdown: 
+            return
+        as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
+        self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
+        self.datastore.close()
+        super().shutdown()
+
+    def actually_shutdown(self):
+        info(f'shutting down {self} (SHUTDOWN)...')
+        self.shutdown_at = now()
+        self.connections.close()
+        self.has_shutdown = True
+Session = RuntimeSession
 
 
 class SessionResult: 
@@ -2493,7 +2578,7 @@ class runtime:
         self.Tbl: type[Session] = import_runtime_from_config('tbl_cls', Tbl)
         self.Session: type[Session] = import_runtime_from_config('session_cls', Session)
         self.Batch: type[Batch] = import_runtime_from_config('batch_cls', Batch)
-        self.Checkpoint: type[Checkpoint] = import_runtime_from_config('checkpoint_cls', Checkpoint)
+        self.Checkpoint: type[Checkpoint] = import_runtime_from_config('checkpoint_cls', CachedCheckpoint)
         self.TaskStore: type[TaskStore] = import_runtime_from_config('task_store_cls', TaskStore)
         self.Task: type[Task] = import_runtime_from_config('task_cls', Task)
         self.TblStore: type[TblStore] = import_runtime_from_config('tbl_store_cls', TblStore)
@@ -2501,6 +2586,15 @@ class runtime:
         self.Cache: type[Cache] = import_runtime_from_config('cache', Cache)
         from anchovies.plugins.core.io import DefaultDataBuffer
         self.DataBuffer: type[DefaultDataBuffer] = import_runtime_from_config('data_buffer_cls', DefaultDataBuffer)
+        # debug(self)
+
+    def __str__(self):
+        classes = list()
+        for _, cls in inspect.getmembers(self): 
+            if _.startswith('_'): 
+                continue
+            classes.append(cast(type, cls).__qualname__)
+        return str(tuple(classes))
 
 
 class AnchoviesEncoder(json.JSONEncoder): 

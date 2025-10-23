@@ -1,15 +1,24 @@
 import os 
 import dateutil
+import logging
 from pathlib import Path
 from datetime import datetime
 from anchovies.sdk import *
+
+
+logger = logging.getLogger(__name__)
+debug = logger.debug
 
 
 @Datastore.register
 class FilesystemDatastore(Datastore): 
     def __init__(self, path: str = None, **kwds):
         super().__init__(path, **kwds)
-        self.root_dir_abs = Path(self.root_dir).expanduser().absolute()
+        self.root_dir_abs = Path(self.root_dir) #.expanduser().absolute()
+        if str(self.root_dir_abs).startswith('~'): 
+            self.root_dir_abs = self.root_dir_abs.expanduser() #.absolute()
+        debug('FilesystemDatastore original %s' % self.original_path)
+        debug('FilesystemDatastore root %s' % self.root_dir_abs)
 
     @staticmethod
     def is_compatible(path):
@@ -23,7 +32,7 @@ class FilesystemDatastore(Datastore):
         
     @property
     def root_dir(self):
-        return (self.origpath or HOME).strip('/')
+        return (self.origpath or HOME).removesuffix('/')
     
     def aspath(self, path): 
         return Path(self.root_dir_abs, path)
@@ -37,7 +46,8 @@ class FilesystemDatastore(Datastore):
 
     def list_files(self, relpathglob=None, *, after=None, before=None):
         import glob
-        stream = glob.iglob(str(self.aspath(relpathglob)), include_hidden=True)
+        path = str(self.aspath(relpathglob))
+        stream = glob.iglob(path, include_hidden=True)
         if after: 
             stream = filter(lambda path: self.st_mtime(path) >= after, stream)
         if before: 
@@ -66,6 +76,6 @@ class FilesystemDatastore(Datastore):
 
     def delete(self, path):
         try: 
-            os.remove(path)
+            os.remove(self.aspath(path))
         except FileNotFoundError: 
             pass
