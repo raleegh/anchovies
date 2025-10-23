@@ -77,28 +77,39 @@ class SourceAllSinkAll(Operator):
         DISTINCT.add(tbl)
 
 
+class ReceiveTask(Operator): 
+    @source()
+    def get(self, task, **kwds): 
+        yield None
+
+
 @fixture
-def downloader(): 
+def downloader(newmeta): 
     op = TestDownloader()
     yield op
 
 
 @fixture
-def wildcard_dwnldr(): 
+def wildcard_dwnldr(newmeta): 
     op = WildcardDownloader()
     yield op
 
 
 @fixture
-def override_dwnldr(): 
+def override_dwnldr(newmeta): 
     op = OverrideDownloader()
     yield op
 
 
 @fixture
-def source_all_dwnldr(): 
+def source_all_dwnldr(newmeta): 
     op = SourceAllSinkAll()
     yield op
+
+
+@fixture
+def receive_task_dwnldr(newmeta): 
+    yield ReceiveTask()
 
 
 def test_still_callable(downloader): 
@@ -173,3 +184,8 @@ def test_source_all_sink_all(source_all_dwnldr):
     StreamingPlan(guide.select(('table1', 'table2'))).run()
     assert MEM > 1, 'The @source() generator should be invoked... TWICE!'
     assert len(DISTINCT) > 1, 'The @sink() should be invoked... TWICE!'
+
+
+def test_receive_task(receive_task_dwnldr): 
+    guide = receive_task_dwnldr.streams
+    StreamingPlan(guide.values()).run()

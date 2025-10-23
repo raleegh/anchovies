@@ -14,7 +14,8 @@ class TestDownloader(Downloader):
 
 class BrokenDownloader(Downloader): 
     @source('sales')
-    def get_bad_table(self, **kwds): 
+    def get_bad_table(self, **kwds):
+        yield {'id': 1}
         raise RuntimeError()
     
     @source('contacts')
@@ -71,5 +72,8 @@ def test_failed_anchovy_run(anchovy, config_str):
     batch = results.batches[0]
     assert batch['status'] == 'ERR'
 
-    task = results.batches[0]['done_tasks'][2]
+    tasks = results.batches[0]['done_tasks']
+    task = [task for task in tasks if task['tbl'] and task['tbl'].name == 'sales'][0]
     assert task['status'] == 'ERR'
+
+    assert len(tasks) == 4

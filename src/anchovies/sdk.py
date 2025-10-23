@@ -229,6 +229,34 @@ def bool_from_str(bool_str: str) -> bool:
     return bool_str[0].upper() == 'T' or bool_str[0].upper() == 'Y'
 
 
+def as_task(*task_args, capture=True, **task_kwds): 
+    '''
+    A helper function to make 
+    decorating/accessing the task API inline easier.
+    '''
+    task_kwds.setdefault('task_type', 'TBL')
+    maybe_callable = task_args[0]
+    if callable(maybe_callable): 
+        inline_decorator = True
+        task_args = task_args[1:]
+    def make_wrapper(callable):
+        def wrapper(*args, **kwds): 
+            res = None
+            with Task.allowing_overflow(*task_args, **task_kwds) as task:
+                kwds['task'] = task
+                res = callable(*args, **kwds)
+                if capture: 
+                    task.with_(res)
+            return res
+        return wrapper
+    if inline_decorator: 
+        decorator = make_wrapper(maybe_callable)
+    else: 
+        def decorator(callable): 
+            return make_wrapper(callable)
+    return decorator
+
+
 class Cols(UserDict):
     '''A column-data type definition list.'''
     def __init__(self, d: dict | str=None, /, **kwds): 
@@ -477,10 +505,10 @@ class Operator:
         '''
         yield from session().datastore.tbl_store
 
-    def run_streams(self, selection: TblSet, /, wrapped_by: Callable=None):
+    def run_streams(self, selection: TblSet, **run_kwds):
         selected_streams = self.streams.select(selection)
         plan = StreamingPlan(selected_streams)
-        plan.run(wrapped_by=wrapped_by)
+        plan.run(**run_kwds)
 
 
 class Stream:
@@ -528,7 +556,7 @@ class Stream:
         *, 
         started_as: 'Stream'=None, 
         started_by: 'Stream'=None,
-        wrapped_by: Callable=None, 
+        wrapped_by: Callable=as_task, 
         **kwds,
     ): 
         # debug(f'node tree for {self} -->\n' + self.print_tree())
@@ -551,10 +579,14 @@ class Stream:
             tbl_name = self.tbl_wildcard
         kwds = dict(stream=self._stream, tbl=runtime().Tbl(tbl_name), **kwds)
         # TODO: consider passing self as stream...
-        if not wrapped_by: 
+        should_wrap = False
+        if isinstance(self, SourceStream): 
+            should_wrap = True
+        if not should_wrap or not wrapped_by: 
             return self.actually_run_as_stream(**kwds)
         kwds['wrapped_by'] = wrapped_by
-        return wrapped_by(self.actually_run_as_stream, **kwds)(**kwds)
+        new_callable = wrapped_by(self.actually_run_as_stream, **kwds)
+        return new_callable(**kwds)
 
     def actually_run_as_stream(self, **kwds): 
         possible_iterator = self(**kwds)
@@ -641,8 +673,11 @@ class SourceStream(Stream):
             sink.maybe_outer().make_ready()
         self.futures = cast(list[gevent.Greenlet], list())
         for sink in sinks: 
+            ctx = cvar.copy_context()
             fut = gevent.Greenlet(
-                sink.outermost_run_as_stream, 
+                # sink.outermost_run_as_stream, 
+                ctx.run,
+                sink.outermost_run_as_stream,
                 started_by=self, 
                 include=self.included,
             )
@@ -1888,34 +1923,6 @@ class Task:
         return json.dumps(info, default=AnchoviesEncoder().default)
 
 
-def as_task(*task_args, capture=True, **task_kwds): 
-    '''
-    A helper function to make 
-    decorating/accessing the task API inline easier.
-    '''
-    maybe_callable = task_args[0]
-    if callable(maybe_callable): 
-        inline_decorator = True
-        task_args = task_args[1:]
-    def make_wrapper(callable):
-        def wrapper(*args, **kwds): 
-            res = None
-            with Task.allowing_overflow(*task_args, **task_kwds) as task:
-                if task.task_type == 'TBL': 
-                    kwds['task'] = task
-                res = callable(*args, **kwds)
-                if capture: 
-                    task.with_(res)
-            return res
-        return wrapper
-    if inline_decorator: 
-        decorator = make_wrapper(maybe_callable)
-    else: 
-        def decorator(callable): 
-            return make_wrapper(callable)
-    return decorator
-
-
 def on_task(task_name: TaskTypeT): 
     '''Schedule a callback to be executed AFTER a task completes.
     
@@ -2365,7 +2372,7 @@ class RuntimeSession(InteractiveSession):
     def startup(self):
         return as_task(self.actually_startup, task_type='STARTUP', capture=False)() 
     
-    def actually_startup(self): 
+    def actually_startup(self, **task_kwds): 
         if self.has_started: 
             return self
         info('')
@@ -2391,7 +2398,7 @@ class RuntimeSession(InteractiveSession):
         self.datastore.close()
         super().shutdown()
 
-    def actually_shutdown(self):
+    def actually_shutdown(self, **task_kwds):
         info(f'shutting down {self} (SHUTDOWN)...')
         self.shutdown_at = now()
         self.connections.close()
@@ -2506,12 +2513,12 @@ class Batch(BaseContext):
         op = session().maybe_make_operator()
         tbls = op.discover_tbls()  # TODO: cache discover tables?
         tbls = self.tbls = session().select_tables(tbls)
-        op.run_streams(tbls, wrapped_by=partial(as_task, task_type='TBL'))
+        op.run_streams(tbls)
 
     def open(self):
         return as_task(self.actually_open, task_type='XOPEN', capture=False)()
     
-    def actually_open(self): 
+    def actually_open(self, **task_kwds): 
         debug(f'opening batch {self}...')
         self.opened_at = now()
         self._context_token = CONTEXT.set(self)
@@ -2525,7 +2532,7 @@ class Batch(BaseContext):
             CONTEXT.reset(self._context_token)
             BATCH.reset(self._batch_token)
     
-    def actually_close(self):
+    def actually_close(self, **task_kwds):
         debug(f'closing batch {self}...')
         self.closed_at = now()
 
