@@ -1571,7 +1571,7 @@ class BaseCheckpoint(Microservice):
     def __getitem__(self, key):
         '''Get a specific checkpoint & deserialize.'''
         if not isinstance(key, str): 
-            key = '.'.join(key)
+            key = '.'.join(map(str, key))
         return self.desget(key)
     
     def __setitem__(self, key, data): 
