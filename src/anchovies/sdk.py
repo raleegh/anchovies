@@ -577,7 +577,10 @@ class Stream:
             tbl_name = started_by.tbl_wildcard
         if not tbl_name:
             tbl_name = self.tbl_wildcard
-        kwds = dict(stream=self._stream, tbl=runtime().Tbl(tbl_name), **kwds)
+        tbl = runtime().Tbl(tbl_name)
+        if str(tbl) in session().datastore.tbl_store: 
+            tbl = session().datastore.tbl_store[str(tbl)]
+        kwds = dict(stream=self._stream, tbl=tbl, **kwds)
         # TODO: consider passing self as stream...
         should_wrap = False
         if isinstance(self, SourceStream): 
@@ -2000,6 +2003,12 @@ class TblStore(Microservice):
     
     def __exit__(self, *args): 
         return self.flush()
+    
+    def __contains__(self, tbl): 
+        return self.tbls.__contains__(tbl)
+    
+    def __getitem__(self, tbl): 
+        return self.tbls.__getitem__(tbl)
 
     def open(self):
         '''Connect to the TblStore.'''
