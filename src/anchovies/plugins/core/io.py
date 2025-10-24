@@ -264,8 +264,10 @@ class DefaultDataBuffer(FileDataBuffer):
 
     def write(self, line):
         self.maybe_make_buffer()
-        self._written_bytes += self._buf.write(line)
+        written = self._buf.write(line)
+        self._written_bytes += written
         self.maybe_flush()
+        return written
 
     def writable(self):
         return self._buf.writable()

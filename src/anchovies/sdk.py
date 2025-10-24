@@ -1573,8 +1573,7 @@ class BaseCheckpoint(Microservice):
 
     def __getitem__(self, key):
         '''Get a specific checkpoint & deserialize.'''
-        if not isinstance(key, str): 
-            key = '.'.join(map(str, key))
+        key = self.make_key(key)
         return self.desget(key)
     
     def __setitem__(self, key, data): 
@@ -1588,6 +1587,13 @@ class BaseCheckpoint(Microservice):
     def from_path(self, path: str): 
         '''Parse the path for a particular checkpoint.'''
         return path.removeprefix(self.db.anchovy_home('$checkpoints') + '/')
+    
+    def make_key(self, key: Sequence[str]): 
+        '''Because some methods support tuple keys, make a safe to use key.'''
+        if isinstance(key, str): 
+            return key
+        key = '.'.join(map(str, key))
+        return key
 
 
 class Checkpoint(BaseCheckpoint):     
