@@ -212,7 +212,7 @@ class TypedJsonBuffer(GzipJsonBuffer):
 
 class DefaultDataBuffer(FileDataBuffer): 
     '''Seek over Gzip'd JSON files in the `$anchovy/data/$tbl` path.'''
-    def __init__(self, path, /, anchovy_id: str, datastore: Datastore=None):
+    def __init__(self, path, /, anchovy_id: str=None, datastore: Datastore=None):
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         if isinstance(path, Tbl): 
