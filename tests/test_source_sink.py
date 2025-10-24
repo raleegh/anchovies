@@ -4,6 +4,13 @@ from anchovies.sdk import Operator, StreamingPlan, source, sink
 
 MEM = 0
 DISTINCT = set()
+SAVESPACE = dict()
+SEQUENCE = list()
+WANT_ERROR = False
+
+
+class TestException(Exception): 
+    ...
 
 
 class TestDownloader(Operator): 
@@ -83,6 +90,40 @@ class ReceiveTask(Operator):
         yield None
 
 
+class ComplexExecution(Operator): 
+    @source('source1')
+    def generate(self, **kwds):
+        data = [
+            dict(cursor=i)
+            for i in range(10)
+        ]
+        for last in data: 
+            SAVESPACE['last_from_source1'] = last
+            SEQUENCE.append(last['cursor'])
+            yield last
+            SAVESPACE['next_from_source1'] = last
+
+    @source('source2')
+    @sink('source1')
+    def sink_source2(self, stream, **kwds): 
+        for last in stream: 
+            SAVESPACE['last_from_source2'] = last
+            SEQUENCE.append(last['cursor'])
+            yield last
+            SAVESPACE['next_from_source2'] = last
+
+    @source('source3')
+    @sink('source2')
+    def sink_source3(self, stream, **kwds): 
+        for i, last in enumerate(stream):
+            if WANT_ERROR and i == 1: 
+                raise TestException('Oh no!')
+            SAVESPACE['last_from_source3'] = last
+            SEQUENCE.append(last['cursor'])
+            yield last
+            SAVESPACE['next_from_source3'] = last
+
+
 @fixture
 def downloader(newmeta): 
     op = TestDownloader()
@@ -110,6 +151,11 @@ def source_all_dwnldr(newmeta):
 @fixture
 def receive_task_dwnldr(newmeta): 
     yield ReceiveTask()
+
+
+@fixture
+def complex_exec(newmeta): 
+    yield ComplexExecution()
 
 
 def test_still_callable(downloader): 
@@ -189,3 +235,40 @@ def test_source_all_sink_all(source_all_dwnldr):
 def test_receive_task(receive_task_dwnldr): 
     guide = receive_task_dwnldr.streams
     StreamingPlan(guide.values()).run()
+
+
+def test_linear_execution(complex_exec):
+    '''This test ensures "linear execution".'''
+    global WANT_ERROR
+    WANT_ERROR = False
+    global SEQUENCE
+    SEQUENCE = list()
+    guide = complex_exec.streams
+    StreamingPlan(guide.values()).run()
+    assert SEQUENCE[0:3] == [0, 0, 0]
+    assert SEQUENCE[3:6] == [1, 1, 1]
+    assert SEQUENCE[-3:] == [9, 9, 9]
+
+
+def test_complex_exception_handling(complex_exec): 
+    '''This test ensures that when an error occurs in a sink, the sources down from it
+    are stopped, which ensures that you can use primitive logic when developing in
+    anchovies. For example, i can track cursors in source1 and not worry about downstream
+    failures because i won't be allowed to move ahead.
+    '''
+    global WANT_ERROR
+    WANT_ERROR = True
+    global SAVESPACE
+    SAVESPACE = dict()
+    guide = complex_exec.streams
+    try:
+        StreamingPlan(guide.values()).run()
+    except TestException:
+        pass
+    # assert SAVESPACE['last_from_source1']['cursor'] == 0
+    assert SAVESPACE['last_from_source2']['cursor'] == 1
+    assert SAVESPACE['last_from_source3']['cursor'] == 0
+    assert SAVESPACE['next_from_source1']['cursor'] == 0
+    assert SAVESPACE['next_from_source2']['cursor'] == 1
+    assert SAVESPACE['next_from_source3']['cursor'] == 0
+    

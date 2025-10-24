@@ -15,8 +15,8 @@ class TestDownloader(Downloader):
 class BrokenDownloader(Downloader): 
     @source('sales')
     def get_bad_table(self, **kwds):
-        yield {'id': 1}
         raise RuntimeError()
+        yield {'id': 1}
     
     @source('contacts')
     def get_contacts(self, **kwds): 
@@ -60,7 +60,7 @@ def test_anchovy_run(anchovy, config_str):
 
     task_types = set(task['task_type'] for task in batch['done_tasks'])
     assert 'XOPEN' in task_types
-    assert 'TABLE' in task_types
+    assert 'TBL' in task_types
     assert 'XCLOSE' in task_types
 
 

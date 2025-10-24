@@ -111,7 +111,7 @@ class GzipJsonBuffer(FileDataBuffer):
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         self._writeable, self._readable = False, False 
-        self._compression_factor = 0.25
+        self._compression_factor = 0.20
         self._buf = None
         self._stack = ExitStack()
 
@@ -138,6 +138,8 @@ class GzipJsonBuffer(FileDataBuffer):
         self._buf = self._stack.enter_context(buf)
 
     def __exit__(self, *args):
+        if self.writable():
+            self._buf.flush()
         self._stack.close()
         return super().__exit__(*args)
 
@@ -218,7 +220,8 @@ class DefaultDataBuffer(FileDataBuffer):
         if isinstance(path, Tbl): 
             anchovy_id = anchovy_id or path.anchovy_id
         self.anchovy_id = anchovy_id or context().anchovy_id
-        self.desired_file_size = 1024 * 1024 * 2  # 2MB
+        self.desired_file_size = 1024 * 1024 * 6  # 6MB
+        # it's BEYOND me, but this calc is WAY off
         self._buffer_cls = TypedJsonBuffer
         self._buf = None
         self._stack = ExitStack()
@@ -302,4 +305,5 @@ class DefaultDataBuffer(FileDataBuffer):
     def __exit__(self, *args):
         self.flush()
         return super().__exit__(*args)
-    # TODO: would like to add threading to do background tasks & concurrency
+        # TODO: would like to add threading to do background tasks & concurrency
+        # TODO: during an error, leaves a bad file

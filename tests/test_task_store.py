@@ -29,7 +29,7 @@ def test_error(newtasks):
 
 def test_sequence_number(newtasks): 
     # pytest closing, so test object count
-    as_task(lambda: None)()
-    as_task(lambda x: None)('foo')
+    as_task(lambda **kwds: None)()
+    as_task(lambda x, **kwds: None)('foo')
     task_logs = list(newtasks.list_files(newtasks.anchovy_home('$task_logs', '*')))
     assert len(task_logs) > 1

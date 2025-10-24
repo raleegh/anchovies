@@ -242,7 +242,8 @@ def as_task(*task_args, capture=True, **task_kwds):
     def make_wrapper(callable):
         def wrapper(*args, **kwds): 
             res = None
-            with Task.allowing_overflow(*task_args, **task_kwds) as task:
+            task = Task.link(*task_args, **task_kwds)
+            with task:
                 kwds['task'] = task
                 res = callable(*args, **kwds)
                 if capture: 
@@ -508,7 +509,7 @@ class Operator:
     def run_streams(self, selection: TblSet, **run_kwds):
         selected_streams = self.streams.select(selection)
         plan = StreamingPlan(selected_streams)
-        plan.run(**run_kwds)
+        plan.run(wrapped_by=batch().apply_execution_policy, **run_kwds)
 
 
 class Stream:
@@ -531,6 +532,9 @@ class Stream:
         self._stream: gqueue.SimpleQueue = None
         # TOOD: also add support for cache style queue
         self.included = set()
+        self.started_as: 'Stream' = None
+        self.started_by: 'Stream' = None
+        self._running_promise: gevent.Greenlet = None
 
     def __str__(self): 
         return self.tbl_wildcard
@@ -556,9 +560,10 @@ class Stream:
         *, 
         started_as: 'Stream'=None, 
         started_by: 'Stream'=None,
-        wrapped_by: Callable=as_task, 
         **kwds,
     ): 
+        self.started_as = started_as
+        self.started_by = started_by
         # debug(f'node tree for {self} -->\n' + self.print_tree())
         if self.outer(): 
             raise AnchovyStreamingError(
@@ -582,14 +587,8 @@ class Stream:
             tbl = session().datastore.tbl_store[str(tbl)]
         kwds = dict(stream=self._stream, tbl=tbl, **kwds)
         # TODO: consider passing self as stream...
-        should_wrap = False
-        if isinstance(self, SourceStream): 
-            should_wrap = True
-        if not should_wrap or not wrapped_by: 
-            return self.actually_run_as_stream(**kwds)
-        kwds['wrapped_by'] = wrapped_by
-        new_callable = wrapped_by(self.actually_run_as_stream, **kwds)
-        return new_callable(**kwds)
+        task = as_task(self.actually_run_as_stream, **kwds)
+        return task(**kwds)
 
     def actually_run_as_stream(self, **kwds): 
         possible_iterator = self(**kwds)
@@ -658,10 +657,36 @@ class Stream:
         new = copy(self)
         new.tbl_wildcard = new_name
         return new
+    
+    def promise(self, started_by: 'Stream'): 
+        '''Run this stream as a "promise" via gevent
+        Greenlet.
 
+        Parameters:
+        * started_by (Stream): the stream starting this new stream
+        '''
+        self._running_promise = gevent.Greenlet(
+            cvar.copy_context().run,
+            self.outermost_run_as_stream,
+            started_by=started_by,
+            include=started_by.included,
+        )
+        self._running_promise.start()
+        return self._running_promise
+
+    def is_dead(self): 
+        '''Check if the underlying promise is alive/dead.'''
+        return self._running_promise.dead
+    
+    def kill(self): 
+        '''Kill the underlying promise.'''
+        return self._running_promise.kill()
+    
 
 class SourceStream(Stream): 
     '''A streaming component that RECEIVES data.'''
+    _sinks = ()
+    
     def __repr__(self): 
         return f'@source(`{self.tbl_wildcard}`)'
     
@@ -675,16 +700,8 @@ class SourceStream(Stream):
         for sink in sinks: 
             sink.maybe_outer().make_ready()
         self.futures = cast(list[gevent.Greenlet], list())
-        for sink in sinks: 
-            ctx = cvar.copy_context()
-            fut = gevent.Greenlet(
-                # sink.outermost_run_as_stream, 
-                ctx.run,
-                sink.outermost_run_as_stream,
-                started_by=self, 
-                include=self.included,
-            )
-            fut.start()
+        for sink in sinks:
+            fut = sink.promise(self)
             self.futures.append(fut)
         super().actually_run_as_stream(**kwds)
         for fut in self.futures: 
@@ -694,10 +711,37 @@ class SourceStream(Stream):
         for i in it:
             for sink in self._sinks: 
                 sink.maybe_outer().put(i)
-                gevent.sleep()
+                gevent.sleep() # breaking here
+            gevent.sleep() # and breaking here
+            if self.check_dead_sinks(): 
+                # gevent.sleep()
+                return
+            # ensures linear execution
+            # i can't explain why, but it does
         for sink in self._sinks:
             sink.maybe_outer().put(StopIteration)
+            gevent.sleep()
+
+    def check_dead_sinks(self): 
+        sinks = self.all_sinks_in_path()
+        check = any(map(Stream.is_dead, sinks))
+        # have to check ALL sinks in the current execution plan
+        if check: 
+            for sink in self._sinks:
+                if sink.is_dead():
+                    continue
+                sink.kill()
+        return check
     
+    def all_sinks_in_path(self): 
+        sinks = set()
+        for source in {*self.roots(), *self.included}:
+            if isinstance(self, SourceStream):
+                sinks.update(source._sinks or ())
+            else: 
+                sinks.add(source)
+        return sinks
+
     def is_root(self): 
         return len(list(self.path())) == 1
 
@@ -734,10 +778,6 @@ class SourceStream(Stream):
     def roots(self): 
         '''Pull the "root" of this stream. Could return `Self`.'''
         return tuple(self.iroots())
-  
-    # def downstream(self): 
-    #     for d in self.guide.sinks.get(str(self)): 
-    #         yield d
 
 
 class SinkStream(Stream): 
@@ -901,6 +941,10 @@ class SinkGuide(UserDict):
         for name, stream in it: 
             yield from yield_included(stream)
 
+    def all(self): 
+        for sinks in self.values(): 
+            yield from sinks
+
 
 class StreamingPlan: 
     '''
@@ -922,16 +966,19 @@ class StreamingPlan:
                 continue
             yield stream
 
-    def schedule_and_complete(self, stream: SourceStream, **stream_kwds):
+    def schedule_and_complete(self, stream: SourceStream, wrapped_by=None, **stream_kwds):
         for root in stream.roots():
             root.include(self.please_include)
-            root.run_as_stream(**stream_kwds)
+            if wrapped_by is not None:
+                wrapped_by(root.run_as_stream, **stream_kwds)
+            else:
+                root.run_as_stream(**stream_kwds)
             self.seen.add(root)
             self.seen.update(root.included)
 
-    def run(self, **stream_kwds): 
+    def run(self, wrapped_by=None, **stream_kwds): 
         for stream in self.iter_streams(): 
-            self.schedule_and_complete(stream, **stream_kwds)
+            self.schedule_and_complete(stream, wrapped_by=wrapped_by, **stream_kwds)
 
 
 
@@ -1059,6 +1106,7 @@ class ConnectionFairy:
         self.operator = self.op = operator
         self.ids = dict(self.find_cnxn_annotations())
         self.data = dict()
+        self._cm_stack = ExitStack()
 
     def __enter__(self): 
         return self.connect()
@@ -1105,6 +1153,7 @@ class ConnectionFairy:
             )
         cnxn = self.ids[id](**attrs, **cnxn_settings)
         self.attach(id, cnxn)
+        return cnxn
 
     def attach(self, id: str, cnxn: Connection): 
         self.data[id] = cnxn
@@ -1183,6 +1232,7 @@ class Anchovy:
         ses = self._session = InteractiveSession(operator_cls, self, **session_kwds)
         ses.startup()
         return ses
+
 
 class Plugin: 
     '''A plugin module from `anchovies.plugins`.
@@ -1694,6 +1744,7 @@ class TaskStore(Microservice):
         self._cvtoken = None
         self._log_num = 0
         self._lock = th.Lock() # TODO: does this need to be gevent?
+        self._running_tasks = dict()
 
     def open(self): 
         '''Connect to the task store.'''
@@ -1703,6 +1754,7 @@ class TaskStore(Microservice):
         '''Disconnect from the task store.'''
         if self._cvtoken:
             OPEN_TASK_STORE.reset(self._cvtoken)
+        self._running_tasks = dict()
 
     def __enter__(self): 
         self.open()
@@ -1722,15 +1774,68 @@ class TaskStore(Microservice):
             key = key or context().batch_guid + '.' + str(self._log_num).zfill(4)
             self._log_num += 1
             return self.db.anchovy_home('$task_logs', f'{key}.json')
+        
+    def maybe_make_task(self, *args, **kwds):
+        '''Get a new task or return the already running task.'''
+        task = runtime().Task.allowing_overflow(*args, **kwds)
+        if task.task_key not in self._running_tasks:
+            self._running_tasks[task.task_key] = task
+            task._task_store = self
+            task.start()
+        return self._running_tasks[task.task_key]
 
 
-OPEN_TASK_STORE = cvar.ContextVar('OPEN_TASK_STORE')
+class NothingTaskStore(TaskStore): 
+    '''A task store that does nothing.'''
+    def __init__(self, db=None):
+        super().__init__(db)
+
+    def open(self): 
+        pass
+
+    def close(self): 
+        pass
+
+    def send(self, task):
+        pass
+
+
+OPEN_TASK_STORE = cvar.ContextVar('OPEN_TASK_STORE', default=NothingTaskStore())
 # no default instance :(
 
 
-TaskTypeT = Literal['STARTUP', 'XOPEN', 'TABLE', 'XCLOSE', 'ERROR', 'SHUTDOWN']
+TaskTypeT = Literal['STARTUP', 'XOPEN', 'TBL', 'XCLOSE', 'ERROR', 'SHUTDOWN']
 ExecStatusT = Literal['OK', 'ERR']
-class Task: 
+class BaseTaskDataMixin: 
+    def __init__(self, data = None): 
+        self.data = data
+
+    def with_(self, data: object | dict | list | str = None, **kwds): 
+        '''Add data to the dynamic `data` attribute of the task log.'''
+        if isinstance(data, Exception): 
+            data = {
+                'err_type': type(data).__name__,
+                'err_msg': str(data),
+            }
+        if not isinstance(data, (dict, list, str)): 
+            new = {
+                k: v for k,v in inspect.getmembers(data)
+                if not callable(v)
+                    and not k.startswith('_')
+            }
+            data = new
+        if kwds: 
+            if not data:  
+                data = dict()
+            data.update(**kwds)
+        with self._lock: 
+            if not self.data: 
+                self.data = {}
+            self.data.update(data)
+        return data
+    
+
+class Task(BaseTaskDataMixin): 
     '''
     Execution of an arbitrary datum of work within anchovies.
 
@@ -1766,6 +1871,8 @@ class Task:
         self.apply_defaults()
         self._ctoken = None
         self._lock = th.Lock() # TODO: does this need to be gevent lock???
+        self._links = list()
+        self._task_store = None
 
     def __str__(self): 
         label = str(self.task_type)
@@ -1778,10 +1885,19 @@ class Task:
     
     def __exit__(self, exctype, *args): 
         self.send()
-        if exctype and issubclass(exctype, Exception): 
-            if session().batch_policy == 'CONTINUE':
-                # this surpresses the error if it's not a shutdown
-                return True
+        # if exctype and issubclass(exctype, Exception): 
+        #     if session().batch_policy == 'CONTINUE':
+        #         # this surpresses the error if it's not a shutdown
+        #         return True
+            
+    @property
+    def task_key(self): 
+        if self.task_type not in {'ERR', 'TBL'}: 
+            return self.task_type
+        return '-'.join((self.task_type, str(self.tbl)))
+    
+    def __hash__(self):
+        return hash(self.task_key)
 
     @staticmethod
     def get_thread_id(): 
@@ -1796,6 +1912,11 @@ class Task:
         signature = inspect.signature(cls.__init__)
         new_kwds = {k: v for k,v in kwds.items() if k in signature.parameters}
         return cls(*args, **new_kwds)
+
+    @classmethod
+    def link(self, *args, **kwds): 
+        task = context().task_store().maybe_make_task(*args, **kwds)
+        return TaskLink(task)
 
     def apply_defaults(self): 
         ctx = context()
@@ -1816,7 +1937,7 @@ class Task:
         if sys.exc_info()[0]: 
             self.status = 'ERR'
         if self.tbl: 
-            self.task_type = 'TABLE'
+            self.task_type = 'TBL'
 
     def start(self):
         '''Start a task for monitoring.'''
@@ -1842,7 +1963,7 @@ class Task:
             self.completed_at = now()
             if context().batch_id and not self.batch_id: 
                 self.batch_id = context().batch_id
-            self.maybe_convert_to_exception()
+            # self.maybe_convert_to_exception()
             if not self.duration: 
                 self.duration = round((self.completed_at - self.timestamp).total_seconds() * 1000)
             msg = 'completed'
@@ -1862,6 +1983,13 @@ class Task:
             self.convert_to_exception()
             self.mark_done()
             raise
+        if self._task_store:
+            del self._task_store._running_tasks[self.task_key]
+
+    def maybe_send(self): 
+        '''Send the task if no links are waiting.'''
+        if not self._links: 
+            self.send()
 
     def convert_to_exception(self): 
         self.with_(sys.exc_info()[1])
@@ -1936,6 +2064,53 @@ class Task:
     def dump(self): 
         info = self.info()
         return json.dumps(info, default=AnchoviesEncoder().default)
+    
+
+class TaskLink(BaseTaskDataMixin):
+    def __init__(self, task: Task):
+        self.task = task
+        self.task._links.append(self)
+        self.data = None
+        self._lock = th.RLock()
+
+    def with_(self, data: object | dict | list | str = None, **kwds): 
+        '''Add data to the dynamic `data` attribute of the task log.'''
+        if isinstance(data, Exception): 
+            data = {
+                'err_type': type(data).__name__,
+                'err_msg': str(data),
+            }
+        if not isinstance(data, (dict, list, str)): 
+            new = {
+                k: v for k,v in inspect.getmembers(data)
+                if not callable(v)
+                    and not k.startswith('_')
+            }
+            data = new
+        if kwds: 
+            if not data:  
+                data = dict()
+            data.update(**kwds)
+        with self._lock: 
+            if not self.data: 
+                self.data = {}
+            self.data.update(data)
+        return data
+    
+    def send(self): 
+        ...
+        self.task.with_(self.data)
+        self.task.maybe_convert_to_exception()
+        with self.task._lock:
+            self.task.thread_id = self.task.get_thread_id()
+            self.task._links.remove(self)
+            self.task.maybe_send()
+    
+    def __enter__(self): 
+        return self 
+    
+    def __exit__(self, *args): 
+        return self.send()
 
 
 def on_task(task_name: TaskTypeT): 
@@ -2125,7 +2300,7 @@ class Cache(Microservice):
             return None
         if value[1] and value[1] > time.time(): 
             return None
-        debug(f'cache hit! {value} expiring in {time.time() - value[1]}')
+        debug(f'cache hit! {value} expiring in {(time.time() - value[1]) if value[1] else "NEVER"}')
         return value[0]
     
     def add_ttl(self, value, ttl):
@@ -2582,6 +2757,18 @@ class Batch(BaseContext):
             if task.status != 'OK': 
                 return 'ERR'
         return 'OK'
+    
+    def apply_execution_policy(self, func, *args, **kwargs):
+        '''Based on the user's desired execution policy, 
+        potentially surpress any errors from within.
+        '''
+        execution_policy = session().batch_policy
+        try: 
+            return func(*args, **kwargs)
+        except Exception:
+            if execution_policy == 'RAISE': 
+                raise
+
     
 
 class DefaultBatch(Batch): ...
