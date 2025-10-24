@@ -2490,6 +2490,10 @@ class Batch(BaseContext):
     def session_id(self): 
         return self.session.session_id
     
+    @property
+    def datastore(self): 
+        return self.session.datastore
+    
     def __repr__(self):
         return f'Batch-{self.batch_id}'
     
