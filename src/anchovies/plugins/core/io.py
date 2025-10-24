@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from datetime import datetime, date, timedelta
 from typing import Iterator
-from anchovies.sdk import Datastore, now, context, cached, get_config
+from anchovies.sdk import Datastore, Tbl, now, context, cached, get_config
 
 
 class BaseDataBuffer(ABC):
@@ -212,9 +212,11 @@ class TypedJsonBuffer(GzipJsonBuffer):
 
 class DefaultDataBuffer(FileDataBuffer): 
     '''Seek over Gzip'd JSON files in the `$anchovy/data/$tbl` path.'''
-    def __init__(self, path, anchovy_id: str, /, datastore: Datastore=None):
+    def __init__(self, path, /, anchovy_id: str, datastore: Datastore=None):
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
+        if isinstance(path, Tbl): 
+            anchovy_id = anchovy_id or path.anchovy_id
         self.anchovy_id = anchovy_id or context().anchovy_id
         self.desired_file_size = 1024 * 1024 * 2  # 2MB
         self._buffer_cls = TypedJsonBuffer
@@ -293,7 +295,7 @@ class DefaultDataBuffer(FileDataBuffer):
     def new_path(self):
         ts = now().strftime('%Y%m%d%H%M%S')
         rand = str(uuid.uuid4())[:3]
-        return self.db.context_home(self.anchovy_id, 'data', self._path, f'{ts}.{rand}.json.gz')
+        return self.db.context_home(self.anchovy_id, 'data', str(self._path), f'{ts}.{rand}.json.gz')
 
     def __exit__(self, *args):
         self.flush()
