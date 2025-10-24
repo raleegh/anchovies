@@ -111,6 +111,7 @@ def touch_checkpoints(
     has_checkpoints = False
     for ckpoint in ckpoints: 
         tbl.add_row((anchovy.user, anchovy.id, *ckpoint))
+        #TODO: truncate values
         has_checkpoints = True
     if not has_checkpoints:
         click.echo('None found!')

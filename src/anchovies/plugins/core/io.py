@@ -121,7 +121,7 @@ class GzipJsonBuffer(FileDataBuffer):
     def write(self, line):
         self.check_write()
         json.dump(line, self._buf)
-        return round(len(line) * self._compression_factor)  # approximation of write size
+        return round(len(str(line)) * self._compression_factor)  # approximation of write size
     
     def writable(self):
         return self._writeable
