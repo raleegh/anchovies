@@ -1578,7 +1578,13 @@ class BaseCheckpoint(Microservice):
     
     def __setitem__(self, key, data): 
         '''Update a specific checkpoint & serialize.'''
+        key = self.make_key(key)
         return self.serput(key, data)
+    
+    def __delitem__(self, key): 
+        '''Delete an item.'''
+        key = self.make_key(key)
+        return self.remove(key)
 
     def as_path(self, key: str): 
         '''Return the path for a particular checkpoint.'''
