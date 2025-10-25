@@ -722,7 +722,7 @@ class Stream:
     # @memoize
     def maybe_outer(self) -> 'Stream': 
         stream = self.outer() or self
-        return copy(stream)
+        return stream.clone()
     
     def outermost_for_scheduling(self): 
         if not self._saved_outermost: 
@@ -783,6 +783,8 @@ class Stream:
     def clone(self, new_name: str=None):
         new = copy(self)
         new.tbl_wildcard = new_name or new.tbl_wildcard
+        new._saved_outermost = None
+        new._stream = None
         new._saved_outermost = None
         return new
     
@@ -859,6 +861,9 @@ class SourceStream(Stream):
             include=self.included,
         )) or ()
         # sinks = self._sinks = tuple(copy(sink) for sink in sinks)
+        assert sinks, \
+            f'No sinks could be matched to {repr(self)}. ' \
+            'This will cause infinite blocking, so an error is raised.'
         for sink in sinks: 
             sink.attach_leader(self.leader or self)
             sink.outermost_for_scheduling().attach_leader(self.leader or self)
@@ -1064,12 +1069,12 @@ class SinkGuide(UserDict):
             for sink in sinks: 
                 outer = sink.maybe_outer()
                 if isinstance(outer, SinkStream): 
-                    yield sink 
+                    yield sink.clone() # always yield a fresh
                     continue
                     # always run sinks
                 if include is not None and outer not in include: 
                     continue
-                yield sink
+                yield sink.clone() # always yield a fresh
         if exact := self.get(pat):
             yield from yield_included(exact)
         it = tuple(self.items())

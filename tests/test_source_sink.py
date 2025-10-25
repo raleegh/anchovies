@@ -54,6 +54,10 @@ class TestDownloader(Operator):
         for row in stream:
             yield row
 
+    @sink('*')
+    def default_sink(self, stream, **kwds): 
+        tuple(stream)
+
 
 class WildcardDownloader(Operator): 
     @source('src1')
@@ -74,6 +78,10 @@ class OverrideDownloader(WildcardDownloader):
     def sink_all(self, **kwds): 
         MEM += 1
     # this _should_ disable the sink
+
+    @sink('*')
+    def new_sink_all(self, stream, **kwds): 
+        tuple(stream)
 
 
 class SourceAllSinkAll(Operator): 
@@ -98,6 +106,10 @@ class ReceiveTask(Operator):
     @source()
     def get(self, task, **kwds): 
         yield None
+
+    @sink()
+    def sink_all(self, stream, **kwds): 
+        tuple(stream)
 
 
 class ComplexExecution(Operator): 
@@ -139,6 +151,10 @@ class ComplexExecution(Operator):
             yield last
             with self._lock:
                 SAVESPACE['next_from_source3'] = last
+
+    @sink('source3')
+    def sink_final(self, stream, **kwds): 
+        tuple(stream)
 
 
 @fixture
