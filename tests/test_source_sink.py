@@ -78,6 +78,10 @@ class SourceAllSinkAll(Operator):
         MEM += 1
         yield {'id': 1}
 
+    @source('something')
+    def gen_something(self, **kwds): 
+        yield 1
+
     @sink()
     def default_sink(self, tbl, **kwds): 
         global DISTINCT
@@ -271,4 +275,12 @@ def test_complex_exception_handling(complex_exec):
     assert SAVESPACE['next_from_source1']['cursor'] == 0
     assert SAVESPACE['next_from_source2']['cursor'] == 1
     assert SAVESPACE['next_from_source3']['cursor'] == 0
+    
+
+def test_source_wildcard(source_all_dwnldr):
+    guide = source_all_dwnldr.streams
+    selection1 = guide.select(('something',))
+    selection2 = guide.select(('something_else',))
+    assert len(selection1) == 1
+    assert len(selection2) == 1
     

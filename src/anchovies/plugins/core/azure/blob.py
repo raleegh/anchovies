@@ -1,7 +1,6 @@
 import os
 import io
 import fnmatch
-import tempfile
 from urllib.parse import urlparse
 from typing import cast
 try:
@@ -10,6 +9,7 @@ try:
 except ImportError: 
     installed = False
 from anchovies.sdk import Datastore, FileInfo
+from anchovies.plugins.core.filesystem import CallbackTempfile
 
 
 AZURE_BLOB_ACCOUNT_URL = os.getenv('AZURE_BLOB_ACCOUNT_URL')
@@ -92,18 +92,6 @@ class BlobDatastore(Datastore):
     def unqualified(self, qualified_path: str) -> str: 
         '''Remove the prefix specified for the datastore connection.'''
         return qualified_path.removeprefix('/').removeprefix(self.prefix)
-
-
-class CallbackTempfile(tempfile.SpooledTemporaryFile): 
-    def __init__(self, *args, callback=None, **kwargs): 
-        super().__init__(*args, **kwargs)
-        self.callback = callback
-    
-    def close(self): 
-        if self.callback is not None: 
-            self.flush()
-            self.callback(self)
-        super().close()
 
 
 if installed: 

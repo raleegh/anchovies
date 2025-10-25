@@ -1,6 +1,8 @@
 import os 
 import dateutil
 import logging
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 from anchovies.sdk import *
@@ -42,7 +44,22 @@ class FilesystemDatastore(Datastore):
         mode += 'b+'
         path = self.aspath(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if 'w' in mode: 
+            return self._openb_write(path, **kwds)
         return open(path, mode, **kwds)
+    
+    def _openb_write(self, path, **kwds): 
+        # i was having trouble with corrupted GZIP files
+        # so send data to spool and then write
+        # that way if the garbage collector is acting up
+        # or doesnt run, no corrupted file
+        def callback(stream):
+            stream.flush()
+            stream.seek(0) 
+            with open(path, 'wb') as fdst:
+                shutil.copyfileobj(stream, fdst)
+        writer = CallbackTempfile(mode='wb+', callback=callback)
+        return writer
 
     def list_files(self, relpathglob=None, *, after=None, before=None):
         import glob
@@ -79,3 +96,15 @@ class FilesystemDatastore(Datastore):
             os.remove(self.aspath(path))
         except FileNotFoundError: 
             pass
+
+
+class CallbackTempfile(tempfile.SpooledTemporaryFile): 
+    def __init__(self, *args, callback=None, **kwargs): 
+        super().__init__(*args, **kwargs)
+        self.callback = callback
+    
+    def close(self): 
+        if self.callback is not None: 
+            self.flush()
+            self.callback(self)
+        super().close()

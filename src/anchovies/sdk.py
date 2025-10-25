@@ -733,6 +733,7 @@ class SourceStream(Stream):
                 sink.kill()
         return check
     
+    @memoize
     def all_sinks_in_path(self): 
         sinks = set()
         for source in {*self.roots(), *self.included}:
@@ -875,6 +876,7 @@ class StreamGuide(UserDict):
     def match(self, pat) -> Iterator[SourceStream]: 
         if exact := self.get(pat):
             yield exact
+            return
         for name, stream in self.copy().items(): 
             if (
                 fnmatch.fnmatch(name, pat) 
