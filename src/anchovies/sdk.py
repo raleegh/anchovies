@@ -12,19 +12,18 @@ import logging.config
 import importlib
 import time
 import atexit
+import uuid
 from abc import ABC, abstractmethod
-from collections import UserDict, UserList, namedtuple
+from collections import UserDict, UserList, namedtuple, deque
 from contextlib import ExitStack
 from types import SimpleNamespace, ModuleType, MethodType
 from typing import cast, Any, Literal, Iterator, Callable, Sequence
 from functools import cache as memoize
 from functools import cached_property as memoprop
-from functools import partial
 from datetime import datetime, UTC
 from copy import copy, deepcopy
+from queue import Queue, Empty, Full
 
-import gevent
-import gevent.queue as gqueue
 import yaml
 
 
@@ -143,6 +142,7 @@ PORT = getenv('PORT', '8080')
 SESSION = cvar.ContextVar('SESSION', default=None)
 CONTEXT = cvar.ContextVar('CONTEXT', default=None)
 BATCH = cvar.ContextVar('BATCH', default=None)
+STREAM_QUEUE_SIZE = getenv('STREAM_QUEUE_SIZE', 1, astype=int)
 
 
 logger = logging.getLogger('anchovies')
@@ -246,7 +246,7 @@ def as_task(*task_args, capture=True, **task_kwds):
             with task:
                 kwds['task'] = task
                 res = callable(*args, **kwds)
-                if capture: 
+                if capture and res: 
                     task.with_(res)
             return res
         return wrapper
@@ -512,6 +512,58 @@ class Operator:
         plan.run(wrapped_by=batch().apply_execution_policy, **run_kwds)
 
 
+class BetterThread(th.Thread):
+    def __init__(self, group = None, target = None, name = None, args = ..., kwargs = None, *, daemon = None):
+        super().__init__(group, target, name, args, kwargs, daemon=daemon)
+        self.exc_info = (None, None, None)
+
+    def run(self):
+        try:
+            return super().run()
+        except Exception: 
+            self.exc_info = sys.exc_info()
+
+    def join(self, timeout = None):
+        super().join(timeout)
+        if self.exc_info[1]: 
+            raise self.exc_info[1]
+
+
+class IterQueue(Queue): 
+    '''A queue that can be naturally iterated.'''
+    def __init__(self, maxsize = 0, signal: th.Event=None):
+        super().__init__(maxsize)
+        self.should_stop = signal
+
+    def __iter__(self): 
+        if self.should_stop is None:
+            yield from iter(self.get, StopIteration)
+            return
+        while not self.should_stop.is_set():
+            try:
+                val = self.get_nowait()
+                if val is StopIteration:
+                    break
+                yield val
+                self.task_done()
+            except Empty: 
+                pass
+    
+    def stop(self): 
+        '''Force the queue to shutdown.'''
+        self.put(StopIteration)
+
+    def put(self, i, block=True, timeout=None):
+        # override so that the signal can prevent put from blocking
+        if self.should_stop is None: 
+            return super().put(i, block=block, timeout=timeout)
+        while not self.should_stop.is_set():
+            try:
+                return super().put(i, block=False)
+            except Full:
+                pass
+
+
 class Stream:
     '''
     A stream is the base unit of the source/sink apparatus 
@@ -529,15 +581,27 @@ class Stream:
         self.operator: Downloader = None
         self.runtime_method: MethodType = None
         self.guide: StreamGuide = None
-        self._stream: gqueue.SimpleQueue = None
+        self._stream: IterQueue = None
         # TOOD: also add support for cache style queue
         self.included = set()
         self.started_as: 'Stream' = None
         self.started_by: 'Stream' = None
-        self._running_promise: gevent.Greenlet = None
+        self._running_promise: th.Thread = None
+        self.leader: 'Stream' = None
+        self.should_stop = th.Event()
+        self.linear_limit = th.Semaphore()
+        self._id = str(uuid.uuid4())
 
     def __str__(self): 
         return self.tbl_wildcard
+    
+    def __hash__(self): 
+        return hash((str(self), self._id))
+    
+    def __eq__(self, other):
+        if not isinstance(other, type(self)): 
+            return False
+        return hash(self) == hash(other)
 
     def __call__(self, *args, **kwds):
         func = self.func
@@ -555,6 +619,26 @@ class Stream:
     # * should the ONLY execution method be "cached" (using pickle)?
     # * is there an option that can use gevent/async
 
+    def schedule_stream(self, **stream_kwds): 
+        '''Entry-point function to set-up the streaming chain.'''
+        self.should_stop = th.Event()
+        self.linear_limit = th.Semaphore()
+        for included in self.included:
+            included.attach_leader(self)
+        fut = BetterThread(
+            target=cvar.copy_context().run,
+            args=(self.run_as_stream,), 
+            kwargs=stream_kwds, 
+        )
+        fut.start()
+        fut.join()
+
+    def attach_leader(self, stream): 
+        '''Make note of the leader stream.'''
+        self.leader = stream
+        self.should_stop = self.leader.should_stop
+        self.linear_limit = self.leader.linear_limit
+
     def run_as_stream(
         self, 
         *, 
@@ -562,19 +646,42 @@ class Stream:
         started_by: 'Stream'=None,
         **kwds,
     ): 
+        '''This will iterate over the provided generator and dump results
+        into sub-streams.
+
+        Params:
+        * started_as (Stream): the Source/Sink the program wanted to schedule.
+            usually, this will be a sink which resolved to a source.
+        * started_by (Stream): the node that caused this node to be scheduled.
+        * **kwds: arguments to pass to Task()
+        '''
+        try:
+            kwds = self._prepare_run_as_stream(started_as, started_by, **kwds)
+            task = as_task(self.actually_run_as_stream, **kwds)
+            return task(**kwds)
+        except BaseException: 
+            self.should_stop.set()
+            raise
+    
+    def _prepare_run_as_stream(self, started_as, started_by, **kwds):
+        source, sink = None, None
         self.started_as = started_as
         self.started_by = started_by
-        # debug(f'node tree for {self} -->\n' + self.print_tree())
+        # break if not outer-most
         if self.outer(): 
             raise AnchovyStreamingError(
                 f'Stream {self} was scheduled even tho '
                 'it is not the outermost stream.'
             )
             # stop execution when the wrong stream is called
+        if self.started_by:
+            self.attach_leader(self.started_by.leader or self.started_by)
+        # determine the source/sink based on started_as/started_by
         if started_as and isinstance(started_as, SinkStream): 
-            kwds['sink'] = started_as
+            kwds['sink'] = sink = started_as
         if started_by and isinstance(started_by, SourceStream): 
-            kwds['source'] = started_by
+            kwds['source'] = source = started_by
+        # resolve the tbl name
         tbl_name = None
         if started_as: 
             tbl_name = started_as.tbl_wildcard
@@ -582,29 +689,28 @@ class Stream:
             tbl_name = started_by.tbl_wildcard
         if not tbl_name:
             tbl_name = self.tbl_wildcard
+        if source: 
+            tbl_name = source.tbl_wildcard
         tbl = runtime().Tbl(tbl_name)
-        if str(tbl) in session().datastore.tbl_store: 
-            tbl = session().datastore.tbl_store[str(tbl)]
+        if tbl in session().datastore.tbl_store: 
+            tbl = session().datastore.tbl_store[tbl]
         kwds = dict(stream=self._stream, tbl=tbl, **kwds)
-        # TODO: consider passing self as stream...
-        task = as_task(self.actually_run_as_stream, **kwds)
-        return task(**kwds)
+        return kwds
 
     def actually_run_as_stream(self, **kwds): 
-        possible_iterator = self(**kwds)
-        self.maybe_iter(possible_iterator)
-
-    def maybe_iter(self, it): 
-        if isinstance(it, Iterator): 
-            for i in it: 
-                gevent.sleep()
+        '''This should "iterate" through the underlying generator (or call function once).'''
+        if hasattr(self.resolve_stream_callable(), '__iter__') \
+                or inspect.isgeneratorfunction(self.resolve_stream_callable()):
+            deque(self(**kwds), 1)
+            return
+        return self(**kwds)
 
     def maybe_mark_outer(self, func: Callable): 
         if not isinstance(func, Stream): 
             return
         func._outer = self
 
-    def outer(self): 
+    def outer(self) -> 'Stream': 
         cur = self
         ret = None
         while outer := cur._outer: 
@@ -612,8 +718,10 @@ class Stream:
             cur = outer
         return ret
     
+    @memoize
     def maybe_outer(self) -> 'Stream': 
-        return self.outer() or self
+        stream = self.outer() or self
+        return copy(stream)
     
     def outermost_run_as_stream(self, *, include=(), **kwds): 
         exe = self.maybe_outer()
@@ -621,7 +729,7 @@ class Stream:
         exe.run_as_stream(started_as=self, **kwds)
     
     def make_ready(self): 
-        self._stream = gqueue.SimpleQueue()
+        self._stream = IterQueue(STREAM_QUEUE_SIZE, self.should_stop)
     
     def make_method(self, operator: Operator): 
         method = MethodType(self.func, operator)
@@ -640,9 +748,21 @@ class Stream:
             yield maybe_substream
             maybe_substream = maybe_substream.func
 
+    # @memoize
+    def resolve_stream_callable(self): 
+        answer = self.func 
+        for sub in self.get_substreams(): 
+            if sub.func is not None:
+                answer = sub.func
+        return answer
+    
     def put(self, obj): 
         if self._stream: 
             self._stream.put(obj)
+
+    def outer_put(self, obj): 
+        if self.maybe_outer()._stream: 
+            self.maybe_outer()._stream.put(obj)
 
     def include(self, seq=()):
         for maybe_include in seq: 
@@ -659,29 +779,31 @@ class Stream:
         return new
     
     def promise(self, started_by: 'Stream'): 
-        '''Run this stream as a "promise" via gevent
-        Greenlet.
+        '''Run this stream as a "promise" via Thread API.
 
         Parameters:
         * started_by (Stream): the stream starting this new stream
         '''
-        self._running_promise = gevent.Greenlet(
-            cvar.copy_context().run,
-            self.outermost_run_as_stream,
-            started_by=started_by,
-            include=started_by.included,
+        self._running_promise = BetterThread(
+            target=cvar.copy_context().run,
+            args=(self.outermost_run_as_stream,),
+            kwargs=dict(
+                started_by=started_by,
+                include=started_by.included,
+            ),
         )
         self._running_promise.start()
         return self._running_promise
 
-    def is_dead(self): 
+    def is_running(self): 
         '''Check if the underlying promise is alive/dead.'''
-        return self._running_promise.dead
+        return self._running_promise.is_alive()
     
-    def kill(self): 
-        '''Kill the underlying promise.'''
-        return self._running_promise.kill()
-    
+    def is_empty(self): 
+        if self._stream is None:
+            return True
+        return not self._stream.full()
+
 
 class SourceStream(Stream): 
     '''A streaming component that RECEIVES data.'''
@@ -691,53 +813,64 @@ class SourceStream(Stream):
         return f'@source(`{self.tbl_wildcard}`)'
     
     def actually_run_as_stream(self, **kwds):
+        kwds = self._prepare_actually_run_as_stream(**kwds)
+        self.futures = cast(list[th.Thread], list())
+        for sink in self._sinks:
+            # sink.attach_leader(self.leader or self) 
+            self.futures.append(sink.promise(self))
+        # running the stream
+        try:
+            if hasattr(self.resolve_stream_callable(), '__iter__') \
+                    or inspect.isgeneratorfunction(self.resolve_stream_callable()):
+                # when iterator
+                for i in self(**kwds): 
+                    self.wait_for_empty_sinks()
+                    for sink in self._sinks: 
+                        sink.outer_put(i)
+                    if self.should_stop.is_set() \
+                            or not all(map(Stream.is_running, self.all_sinks_in_path())): 
+                        debug(f'A single stream was detected broken, so crashing all for {self}/{self.leader}.')
+                        break
+                for sink in self._sinks:
+                    debug(f'Forward end of stream to {sink}')
+                    sink.outer_put(StopIteration)
+            else:
+                raise BaseAnchovyException('Expected iterator.')
+            # raise exception/wait for finish :)
+            for fut in self.futures: 
+                fut.join()
+        except BaseException:
+            self.should_stop.set()
+            raise
+
+    def _prepare_actually_run_as_stream(self, **kwds):
         if 'source' not in kwds:
             kwds['source'] = self
         sinks = self._sinks = tuple(self.guide.sinks.match(
             str(self),
             include=self.included,
         )) or ()
+        # sinks = self._sinks = tuple(copy(sink) for sink in sinks)
         for sink in sinks: 
+            sink.attach_leader(self.leader or self)
+            sink.maybe_outer().attach_leader(self.leader or self)
             sink.maybe_outer().make_ready()
-        self.futures = cast(list[gevent.Greenlet], list())
-        for sink in sinks:
-            fut = sink.promise(self)
-            self.futures.append(fut)
-        super().actually_run_as_stream(**kwds)
-        for fut in self.futures: 
-            fut.get() # raise exception/wait for finish :)
+        return kwds
 
-    def maybe_iter(self, it):
-        for i in it:
-            for sink in self._sinks: 
-                sink.maybe_outer().put(copy(i))
-                gevent.sleep() # breaking here
-            gevent.sleep() # and breaking here
-            if self.check_dead_sinks(): 
-                # gevent.sleep()
+    def wait_for_empty_sinks(self): 
+        '''Wait for all sinks to show empty.'''
+        if not self._sinks:
+            return
+        while True: 
+            if all(map(Stream.is_empty, self._sinks)): 
                 return
-            # ensures linear execution
-            # i can't explain why, but it does
-        for sink in self._sinks:
-            sink.maybe_outer().put(StopIteration)
-            gevent.sleep()
 
-    def check_dead_sinks(self): 
-        sinks = self.all_sinks_in_path()
-        check = any(map(Stream.is_dead, sinks))
-        # have to check ALL sinks in the current execution plan
-        if check: 
-            for sink in self._sinks:
-                if sink.is_dead():
-                    continue
-                sink.kill()
-        return check
-    
     @memoize
     def all_sinks_in_path(self): 
         sinks = set()
-        for source in {*self.roots(), *self.included}:
-            if isinstance(self, SourceStream):
+        st = self.leader or self
+        for source in {*st.roots(), *st.included}:
+            if isinstance(st, SourceStream):
                 sinks.update(source._sinks or ())
             else: 
                 sinks.add(source)
@@ -852,7 +985,7 @@ class StreamGuide(UserDict):
     def __init__(self, operator: 'Downloader'): 
         super().__init__()
         self.operator = self.op = operator
-        self.streams = set()
+        self.streams = list()
         self.sources = self.data
         for attr, stream in inspect.getmembers(self.op): 
             if isinstance(stream, Stream): 
@@ -863,10 +996,10 @@ class StreamGuide(UserDict):
         self.sinks = SinkGuide(self)
 
     def save_stream(self, stream: Stream): 
-        if stream in self.streams: 
-            return
+        # if stream in self.streams: 
+        #     return
         stream.guide = self
-        self.streams.add(stream)
+        self.streams.append(stream)
         if isinstance(stream, SourceStream): 
             self.sources[str(stream)] = stream
 
@@ -972,9 +1105,9 @@ class StreamingPlan:
         for root in stream.roots():
             root.include(self.please_include)
             if wrapped_by is not None:
-                wrapped_by(root.run_as_stream, **stream_kwds)
+                wrapped_by(root.schedule_stream, **stream_kwds)
             else:
-                root.run_as_stream(**stream_kwds)
+                root.schedule_stream(**stream_kwds)
             self.seen.add(root)
             self.seen.update(root.included)
 
@@ -1195,10 +1328,10 @@ class Anchovy:
         ses = runtime().Session(operator_cls, self, **session_kwds)
         return self.run_with_session(ses, operator_cls, **session_kwds)
     
-    def run_with_session(self, session, operator_cls: type[Downloader], /, **session_kwds): 
+    def run_with_session(self, session: 'Session', operator_cls: type[Downloader], /, **session_kwds): 
         with session:
-            for batch in session.iter_batches(): 
-                batch()
+            for b in session.iter_batches(): 
+                b.run()
         return session.results()
     
     def run_with_exception_handling(self, operator_cls: type[Downloader], /, **session_kwds) \
@@ -1747,8 +1880,13 @@ class TaskStore(Microservice):
         super().__init__(db)
         self._cvtoken = None
         self._log_num = 0
-        self._lock = th.Lock() # TODO: does this need to be gevent?
+        self._lock = th.RLock()
         self._running_tasks = dict()
+
+    @property
+    def running_tasks(self): 
+        with self._lock: 
+            return self._running_tasks
 
     def open(self): 
         '''Connect to the task store.'''
@@ -1758,7 +1896,8 @@ class TaskStore(Microservice):
         '''Disconnect from the task store.'''
         if self._cvtoken:
             OPEN_TASK_STORE.reset(self._cvtoken)
-        self._running_tasks = dict()
+        with self._lock:
+            self._running_tasks = dict()
 
     def __enter__(self): 
         self.open()
@@ -1782,11 +1921,11 @@ class TaskStore(Microservice):
     def maybe_make_task(self, *args, **kwds):
         '''Get a new task or return the already running task.'''
         task = runtime().Task.allowing_overflow(*args, **kwds)
-        if task.task_key not in self._running_tasks:
-            self._running_tasks[task.task_key] = task
+        if task.task_key not in self.running_tasks:
+            self.running_tasks[task.task_key] = task
             task._task_store = self
             task.start()
-        return self._running_tasks[task.task_key]
+        return self.running_tasks[task.task_key]
 
 
 class NothingTaskStore(TaskStore): 
@@ -1874,7 +2013,7 @@ class Task(BaseTaskDataMixin):
         self.status = status
         self.apply_defaults()
         self._ctoken = None
-        self._lock = th.Lock() # TODO: does this need to be gevent lock???
+        self._lock = th.RLock()
         self._links = list()
         self._task_store = None
 
@@ -1905,10 +2044,11 @@ class Task(BaseTaskDataMixin):
 
     @staticmethod
     def get_thread_id(): 
-        if g := gevent.getcurrent(): 
-            return f'Greenlet-{id(g)}'
         if t := th.get_ident(): 
-            return f'Thread-{t}'
+            if t != th.main_thread().ident:
+                return f'Thread-{t}'
+            else: 
+                return 'Main'
         
     @classmethod
     def allowing_overflow(cls, *args, **kwds): 
@@ -1988,7 +2128,7 @@ class Task(BaseTaskDataMixin):
             self.mark_done()
             raise
         if self._task_store:
-            del self._task_store._running_tasks[self.task_key]
+            del self._task_store.running_tasks[self.task_key]
 
     def maybe_send(self): 
         '''Send the task if no links are waiting.'''
@@ -2196,9 +2336,13 @@ class TblStore(Microservice):
         return self.flush()
     
     def __contains__(self, tbl): 
+        if isinstance(tbl, Tbl): 
+            tbl = tbl.qualname
         return self.tbls.__contains__(tbl)
     
     def __getitem__(self, tbl): 
+        if isinstance(tbl, Tbl): 
+            tbl = tbl.qualname
         return self.tbls.__getitem__(tbl)
 
     def open(self):
@@ -2702,12 +2846,18 @@ class Batch(BaseContext):
         timeout_lbl = f'{timeout:,}s' if timeout else 'UNLIMITED'
         with self:
             try:
-                fut = gevent.Greenlet(self.actually_run)
+                fut = BetterThread(
+                    target=cvar.copy_context().run,
+                    args=(self.actually_run,),
+                )
                 debug(f'start batch future with timeout --> {timeout_lbl}')
-                fut.run()
-                fut.get(timeout=timeout)
-            except gevent.Timeout as e: 
-                fut.kill()
+                fut.start()
+                fut.join(timeout=timeout)
+                if fut.is_alive(): 
+                    raise TimeoutError('Thread.join() timed out uncompleted.')
+                    # TODO: test :)
+            except TimeoutError as e: 
+                # fut.kill()
                 raise AnchovyExecutionTimeout(
                     f'The batch {self} did not complete in the expected timeout'
                     f' of {timeout} seconds.'

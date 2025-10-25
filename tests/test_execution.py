@@ -8,8 +8,8 @@ class TestDownloader(Downloader):
         yield {'id': 1}
 
     @sink()
-    def default_sink(self, **kwds): 
-        pass
+    def default_sink(self, stream, **kwds): 
+        list(stream)
 
 
 class BrokenDownloader(Downloader): 
@@ -23,8 +23,8 @@ class BrokenDownloader(Downloader):
         yield {'id': 1}
 
     @sink()
-    def default_sink(self, **kwds): 
-        pass
+    def default_sink(self, stream, **kwds): 
+        list(stream)
   
 
 @fixture
