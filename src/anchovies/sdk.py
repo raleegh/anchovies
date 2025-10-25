@@ -591,6 +591,7 @@ class Stream:
         self.should_stop = th.Event()
         self.linear_limit = th.Semaphore()
         self._id = str(uuid.uuid4())
+        self._saved_outermost = None
 
     def __str__(self): 
         return self.tbl_wildcard
@@ -723,8 +724,14 @@ class Stream:
         stream = self.outer() or self
         return copy(stream)
     
+    def outermost_for_scheduling(self): 
+        if not self._saved_outermost: 
+            new = self.maybe_outer()
+            self._saved_outermost = new
+        return self._saved_outermost
+    
     def outermost_run_as_stream(self, *, include=(), **kwds): 
-        exe = self.maybe_outer()
+        exe = self.outermost_for_scheduling()
         exe.include(include)
         exe.run_as_stream(started_as=self, **kwds)
     
@@ -761,8 +768,8 @@ class Stream:
             self._stream.put(obj)
 
     def outer_put(self, obj): 
-        if self.maybe_outer()._stream: 
-            self.maybe_outer()._stream.put(obj)
+        if self.outermost_for_scheduling()._stream: 
+            self.outermost_for_scheduling()._stream.put(obj)
 
     def include(self, seq=()):
         for maybe_include in seq: 
@@ -776,6 +783,7 @@ class Stream:
     def clone(self, new_name: str=None):
         new = copy(self)
         new.tbl_wildcard = new_name or new.tbl_wildcard
+        new._saved_outermost = None
         return new
     
     def promise(self, started_by: 'Stream'): 
@@ -853,8 +861,8 @@ class SourceStream(Stream):
         # sinks = self._sinks = tuple(copy(sink) for sink in sinks)
         for sink in sinks: 
             sink.attach_leader(self.leader or self)
-            sink.maybe_outer().attach_leader(self.leader or self)
-            sink.maybe_outer().make_ready()
+            sink.outermost_for_scheduling().attach_leader(self.leader or self)
+            sink.outermost_for_scheduling().make_ready()
         return kwds
 
     def wait_for_empty_sinks(self): 
