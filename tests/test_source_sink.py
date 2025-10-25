@@ -27,7 +27,9 @@ class TestDownloader(Operator):
     @source('sample_transf1')
     @sink('sample')
     def sink_sample_transf1(self, stream, **kwds): 
-        yield from stream
+        for row in stream:
+            row.update(new='new')
+            yield row
 
     @source('sample_transf2')
     @sink('sample')
@@ -48,7 +50,8 @@ class TestDownloader(Operator):
     def sink_nested(self, stream, **kwds): 
         global MEM 
         MEM += 1
-        yield from stream
+        for row in stream:
+            yield stream
 
 
 class WildcardDownloader(Operator): 

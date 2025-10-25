@@ -710,7 +710,7 @@ class SourceStream(Stream):
     def maybe_iter(self, it):
         for i in it:
             for sink in self._sinks: 
-                sink.maybe_outer().put(i)
+                sink.maybe_outer().put(copy(i))
                 gevent.sleep() # breaking here
             gevent.sleep() # and breaking here
             if self.check_dead_sinks(): 
@@ -1013,7 +1013,9 @@ class Downloader(Operator):
     def default_sink(self, stream, tbl, **kwds): 
         buf = self.data_buffer_cls(tbl)
         with buf: 
-            buf.writelines(stream)
+            for line in stream:
+                buf.write(line)
+                yield line
 
 
 class Uploader(Operator): 
