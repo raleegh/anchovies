@@ -718,7 +718,7 @@ class Stream:
             cur = outer
         return ret
     
-    @memoize
+    # @memoize
     def maybe_outer(self) -> 'Stream': 
         stream = self.outer() or self
         return copy(stream)
@@ -773,9 +773,9 @@ class Stream:
                 continue
             self.included.add(maybe_include)
 
-    def clone(self, new_name: str):
+    def clone(self, new_name: str=None):
         new = copy(self)
-        new.tbl_wildcard = new_name
+        new.tbl_wildcard = new_name or new.tbl_wildcard
         return new
     
     def promise(self, started_by: 'Stream'): 
