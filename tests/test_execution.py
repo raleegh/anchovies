@@ -1,5 +1,5 @@
 from pytest import fixture
-from anchovies.sdk import Anchovy, Downloader, SessionResult, source, sink
+from anchovies.sdk import Anchovy, AnchovyExecutionTimeout, Downloader, SessionResult, source, sink
 
 
 class TestDownloader(Downloader): 
@@ -25,6 +25,17 @@ class BrokenDownloader(Downloader):
     @sink()
     def default_sink(self, stream, **kwds): 
         list(stream)
+
+
+class TimeoutDownloader(Downloader): 
+    @source('sales')
+    def simulate_slow_process(self, **kwds): 
+        for i in range(10_000_000): 
+            yield i
+
+    @sink()
+    def default_sink(self, stream, **kwds): 
+        tuple(stream)
   
 
 @fixture
@@ -77,3 +88,15 @@ def test_failed_anchovy_run(anchovy, config_str):
     assert task['status'] == 'ERR'
 
     assert len(tasks) == 4
+
+
+def test_timeout(anchovy, config_str):
+    try:
+        anchovy.run(
+            TimeoutDownloader, 
+            execution_timeout=2, 
+            batch_policy='RAISE',
+            config_str=config_str, 
+        )
+    except AnchovyExecutionTimeout as e: 
+        pass

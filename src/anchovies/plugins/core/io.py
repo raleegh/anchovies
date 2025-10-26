@@ -3,9 +3,10 @@ import gzip
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, UTC
+from pytz import timezone
 from typing import Iterator
-from anchovies.sdk import Datastore, Tbl, now, context, cached, get_config
+from anchovies.sdk import Datastore, Tbl, Task, now, context, cached, get_config
 
 
 class BaseDataBuffer(ABC):
@@ -83,6 +84,10 @@ class BaseDataBuffer(ABC):
         '''Write a series of dictionaries to the buffer.'''
         return sum(self.write(line) for line in lines)
     
+    def close(self): 
+        '''Close the buffer.'''
+        ...
+
     def __iter__(self): 
         return self.read()
     
@@ -90,7 +95,7 @@ class BaseDataBuffer(ABC):
         return self
 
     def __exit__(self, *args): 
-        pass
+        self.close()
 
 
 class FileDataBuffer(BaseDataBuffer): 
@@ -176,6 +181,7 @@ class TypedJsonBuffer(GzipJsonBuffer):
     
     def to_annotated(self, line: dict) -> dict: 
         '''Add the "_types" attribute to re-serialize later.'''
+        line = {k: v for k, v in line.items()}
         types = dict()
         changed = dict()
         for k, v in line.items(): 
@@ -213,9 +219,12 @@ class TypedJsonBuffer(GzipJsonBuffer):
         yield from (tuple(s.split('@')) for s in t.split(' '))
 
 
-class DefaultDataBuffer(FileDataBuffer): 
+class NaivePathBuffer(FileDataBuffer): 
     '''Seek over Gzip'd JSON files in the `$anchovy/data/$tbl` path.'''
     def __init__(self, path, /, anchovy_id: str=None, datastore: Datastore=None):
+        self.tbl = None
+        if isinstance(path, Tbl): 
+            self.tbl = path
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         if isinstance(path, Tbl): 
@@ -233,29 +242,46 @@ class DefaultDataBuffer(FileDataBuffer):
     def seekable(self):
         return True 
     
+    def make_data_path(self, extra: str=None): 
+        '''Build the Anchovies data path.
+
+        Example: `$anchovies/$user/$id/$tbl/data/{{extra}}*`
+        '''
+        if self.tbl and 'path' in self.tbl.properties: 
+            return self.make_custom_path(extra)
+        path = self.db.context_home(
+            self.anchovy_id, 
+            'data', 
+            self._path, 
+            (extra or '') + '*'
+        )
+        return path
+    
+    def make_custom_path(self, extra: str=None):
+        '''Build a data path based on the Tbl's settings.'''
+        path = self.tbl.properties['path']
+        parts = list(path.split('*'))
+        if extra:
+            if len(parts) > 1:
+                parts.insert(-1, extra)
+            else: 
+                parts[0] = parts[0] + '/' + extra
+        return '*'.join(parts)
+
     @cached('io.readpaths', ttl_hook=lambda: get_config('io_cache_ttl', 60 * 10, astype=int))
     def readpaths(self, hint = -1):
         def generate():
             total_read = 0
-            until = now()
-            today = after = self.tell()
-            while today <= until: 
-                date_part = today.strftime('%Y%m%d')
-                path = self.db.context_home(
-                    self.anchovy_id, 
-                    'data', 
-                    self._path, 
-                    date_part + '*'
-                )
-                for path in self.db.list_files(path, after=after): 
-                    self._path = path
-                    info = self.db.describe(path)
-                    self._position = info.modified_at
-                    total_read += info.size
-                    yield path
-                    if hint > 1 and total_read > hint: 
-                        break
-                today += timedelta(days=1)
+            after = self.tell()
+            path = self.make_data_path()
+            for path in self.db.list_files(path, after=after): 
+                self._path = path
+                info = self.db.describe(path)
+                self._position = info.modified_at
+                total_read += info.size
+                yield path
+                if hint > 1 and total_read > hint: 
+                    break
         return tuple(generate())
     
     def read(self, hint=-1):
@@ -308,3 +334,101 @@ class DefaultDataBuffer(FileDataBuffer):
         return super().__exit__(*args)
         # TODO: would like to add threading to do background tasks & concurrency
         # TODO: during an error, leaves a bad file
+
+
+class DatetimePathBuffer(NaivePathBuffer): 
+    '''Seek over Gzip'd JSON files in the `$anchovy/data/$tbl/YYYmmdd*` path.
+    
+    Because the path must have the day in the prefix, we can more intelligently 
+    scan over files associated to the buffer.
+    '''
+    @cached('io.readpaths', ttl_hook=lambda: get_config('io_cache_ttl', 60 * 10, astype=int))
+    def readpaths(self, hint = -1):
+        def generate():
+            total_read = 0
+            until = now()
+            today = after = self.tell()
+            while today <= until: 
+                date_part = today.strftime('%Y%m%d')
+                path = self.make_data_path(date_part)
+                for path in self.db.list_files(path, after=after): 
+                    self._path = path
+                    info = self.db.describe(path)
+                    self._position = info.modified_at
+                    total_read += info.size
+                    yield path
+                    if hint > 1 and total_read > hint: 
+                        break
+                today += timedelta(days=1)
+        return tuple(generate())
+
+
+class StatisticsBuffer(DatetimePathBuffer): 
+    '''Collect stream statistics as write activities take place.'''
+    def __init__(self, path, /, anchovy_id = None, datastore = None):
+        super().__init__(path, anchovy_id, datastore)
+        self.task = None
+        self._stats_written_bytes = 0
+        self._stats_row_count = 0
+        self._stats_data_change_timestamp_field = None
+        self._stats_last_data_change_timestamp = None
+        if self.tbl: 
+            if self.tbl.data_change_timestamp_field: 
+                self._stats_data_change_timestamp_field = \
+                    self.tbl.data_change_timestamp_field
+                self.check_data_change_timestamp = self._check_dcts
+        self._timezone = timezone(get_config('data_timezone', 'UTC'))
+
+    def attach_task(self, task: Task): 
+        '''Associate an anchovies Task object for monitoring.'''
+        self.task = task
+
+    def has_task(self): 
+        '''Check if a task was associated.'''
+        return self.task is not None
+    
+    def write(self, line):
+        b = super().write(line)
+        self.check_data_change_timestamp(line)
+        self._stats_written_bytes += b
+        self._stats_row_count += 1
+        return b 
+    
+    def check_data_change_timestamp(self, line: dict): 
+        '''Check if the row has a data change timestamp.
+        
+        If it does, save the value if it is larger than the last.
+        '''
+        pass
+
+    def _check_dcts(self, line: dict): 
+        val: datetime = line.get(self._stats_data_change_timestamp_field)
+        if val: 
+            if val.tzinfo is None: 
+                val = self._timezone.localize(val)
+            if self._stats_last_data_change_timestamp: 
+                val = max(val, self._stats_last_data_change_timestamp)
+                self._stats_last_data_change_timestamp = val
+
+    def close(self): 
+        super().close()
+        if not self.has_task(): 
+            return
+        lag = None
+        if self._stats_last_data_change_timestamp:
+            lag = round(
+                (
+                    datetime.now(UTC)
+                        - self._stats_last_data_change_timestamp
+                ).total_seconds()
+            )
+        self.task.with_(
+            size=self._stats_written_bytes,
+            rows=self._stats_row_count,
+            last_data_change_timestamp=self._stats_last_data_change_timestamp,
+            lag=lag,
+        )
+
+
+# save for export
+DefaultDataBuffer = StatisticsBuffer

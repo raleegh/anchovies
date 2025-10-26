@@ -349,6 +349,7 @@ class Tbl:
         set_by: ColSelect=None,
         sort_by: SortedColSelect=None,
         deleted_ttl: int=None,
+        data_change_timestamp_field: str=None,
         # logical_timestamp
         **properties,
     ): 
@@ -360,6 +361,7 @@ class Tbl:
         self.sort_by = SortedColSelect(sort_by) or SortedColSelect()
         self.deleted_ttl = deleted_ttl
         self.properties = properties
+        self.data_change_timestamp_field = data_change_timestamp_field
 
     def __str__(self):
         return self.name
@@ -588,9 +590,10 @@ class Stream:
         self._running_promise: th.Thread = None
         self.leader: 'Stream' = None
         self.should_stop = th.Event()
-        self.linear_limit = th.Semaphore()
+        # self.linear_limit = th.Semaphore()
         self._id = str(uuid.uuid4())
         self._saved_outermost = None
+        self.overseer: 'Overseer' = None
 
     def __str__(self): 
         return self.tbl_wildcard
@@ -634,9 +637,10 @@ class Stream:
     def schedule_stream(self, **stream_kwds): 
         '''Entry-point function to set-up the streaming chain.'''
         self.should_stop = th.Event()
-        self.linear_limit = th.Semaphore()
+        # self.linear_limit = th.Semaphore()
         for included in self.included:
             included.attach_leader(self)
+        session().overseer.oversee(self)
         fut = BetterThread(
             target=cvar.copy_context().run,
             args=(self.run_as_stream,), 
@@ -644,12 +648,13 @@ class Stream:
         )
         fut.start()
         fut.join()
+        session().overseer.notify_done(self)
 
     def attach_leader(self, stream): 
         '''Make note of the leader stream.'''
         self.leader = stream
         self.should_stop = self.leader.should_stop
-        self.linear_limit = self.leader.linear_limit
+        # self.linear_limit = self.leader.linear_limit
 
     def run_as_stream(
         self, 
@@ -828,6 +833,10 @@ class Stream:
         if self._stream is None:
             return True
         return not self._stream.full()
+    
+    def stop(self): 
+        '''Toggle the internal signal to stop all streaming activity.'''
+        self.should_stop.set()
 
 
 class SourceStream(Stream): 
@@ -1141,6 +1150,31 @@ class StreamingPlan:
             self.schedule_and_complete(stream, wrapped_by=wrapped_by, **stream_kwds)
 
 
+class Overseer:
+    '''A supervisor that watches runtime and helps with crash scenarios.'''
+    def __init__(self, session: 'Session'): 
+        self.session = session
+        self.running_streams = list()
+        self.mutex = th.RLock()
+
+    def crash(self): 
+        '''Stop all running streams.'''
+        with self.mutex:
+            for stream in self.running_streams: 
+                stream.stop()
+                self.notify_done(stream)
+
+    def oversee(self, stream: Stream): 
+        '''Attach the overseer to a stream.'''
+        with self.mutex:
+            stream = stream.leader or stream
+            self.running_streams.append(stream)
+            stream.overseer = self
+
+    def notify_done(self, stream): 
+        '''Remove running stream b/c done.'''
+        self.running_streams.remove(stream)
+
 
 class Downloader(Operator): 
     '''
@@ -1166,10 +1200,16 @@ class Downloader(Operator):
     def __init__(self):
         super().__init__()
         self.data_buffer_cls = runtime().DataBuffer
+        from anchovies.plugins.core.io import StatisticsBuffer
+        self.supports_statistics = False
+        if issubclass(self.data_buffer_cls, StatisticsBuffer): 
+            self.supports_statistics = True
 
     @sink()
-    def default_sink(self, stream, tbl, **kwds): 
+    def default_sink(self, stream, tbl, task, **kwds): 
         buf = self.data_buffer_cls(tbl)
+        if self.supports_statistics:
+            buf.attach_task(task)
         with buf: 
             for line in stream:
                 buf.write(line)
@@ -2628,6 +2668,7 @@ class InteractiveSession(BaseContext):
             logging.config.fileConfig(LOGGING_CONFIG_FILE)
         logger.setLevel(log_level_num)
         self._lock = th.Lock()
+        self.overseer = Overseer(self)
 
     def __repr__(self):
         return f'{type(self).__name__}-{self.session_id}'
@@ -2883,6 +2924,7 @@ class Batch(BaseContext):
                     # TODO: test :)
             except TimeoutError as e: 
                 # fut.kill()
+                session().overseer.crash()
                 raise AnchovyExecutionTimeout(
                     f'The batch {self} did not complete in the expected timeout'
                     f' of {timeout} seconds.'
