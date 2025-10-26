@@ -301,7 +301,7 @@ def test_complex_exception_handling(complex_exec):
     # assert SAVESPACE['last_from_source1']['cursor'] == 0
     # assert SAVESPACE['last_from_source2']['cursor'] <= 2
     # assert SAVESPACE['last_from_source3']['cursor'] == 0
-    assert SAVESPACE['next_from_source1']['cursor'] <= 3
+    assert SAVESPACE['next_from_source1']['cursor'] <= 2
     assert SAVESPACE['next_from_source2']['cursor'] <= 1
     assert SAVESPACE['next_from_source3']['cursor'] == 0
     

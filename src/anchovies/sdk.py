@@ -142,7 +142,6 @@ PORT = getenv('PORT', '8080')
 SESSION = cvar.ContextVar('SESSION', default=None)
 CONTEXT = cvar.ContextVar('CONTEXT', default=None)
 BATCH = cvar.ContextVar('BATCH', default=None)
-STREAM_QUEUE_SIZE = getenv('STREAM_QUEUE_SIZE', 1, astype=int)
 
 
 logger = logging.getLogger('anchovies')
@@ -620,6 +619,18 @@ class Stream:
     # * should the ONLY execution method be "cached" (using pickle)?
     # * is there an option that can use gevent/async
 
+    def __iter__(self): 
+        yield from self._stream
+
+    def iter_rows(self, *args, **kwds):
+        '''Iterate in sync with the should stop signal.''' 
+        it = self(*args, **kwds)
+        while not self.should_stop.is_set():
+            try: 
+                yield next(it)
+            except StopIteration: 
+                break
+
     def schedule_stream(self, **stream_kwds): 
         '''Entry-point function to set-up the streaming chain.'''
         self.should_stop = th.Event()
@@ -695,7 +706,7 @@ class Stream:
         tbl = runtime().Tbl(tbl_name)
         if tbl in session().datastore.tbl_store: 
             tbl = session().datastore.tbl_store[tbl]
-        kwds = dict(stream=self._stream, tbl=tbl, **kwds)
+        kwds = dict(stream=self, tbl=tbl, **kwds)
         return kwds
 
     def actually_run_as_stream(self, **kwds): 
@@ -736,7 +747,11 @@ class Stream:
         exe.run_as_stream(started_as=self, **kwds)
     
     def make_ready(self): 
-        self._stream = IterQueue(STREAM_QUEUE_SIZE, self.should_stop)
+        '''Attach a queue to this stream in prep for scheduling.'''
+        self._stream = IterQueue(
+            get_config('stream_queue_size', 0, astype=int), 
+            self.should_stop,
+        )
     
     def make_method(self, operator: Operator): 
         method = MethodType(self.func, operator)
@@ -830,20 +845,17 @@ class SourceStream(Stream):
             self.futures.append(sink.promise(self))
         # running the stream
         try:
+            # when iterator
             if hasattr(self.resolve_stream_callable(), '__iter__') \
                     or inspect.isgeneratorfunction(self.resolve_stream_callable()):
-                # when iterator
-                for i in self(**kwds): 
-                    self.wait_for_empty_sinks()
-                    for sink in self._sinks: 
-                        sink.outer_put(i)
-                    if self.should_stop.is_set() \
-                            or not all(map(Stream.is_running, self.all_sinks_in_path())): 
-                        debug(f'A single stream was detected broken, so crashing all for {self}/{self.leader}.')
-                        break
-                for sink in self._sinks:
+                # "precompute" sinks
+                sinks = tuple(s.outermost_for_scheduling()._stream.put for s in self._sinks)
+                for i in self.iter_rows(**kwds): 
+                    for sink in sinks: 
+                        sink(copy(i))
+                for sink in sinks:
                     debug(f'Forward end of stream to {sink}')
-                    sink.outer_put(StopIteration)
+                    sink(StopIteration)
             else:
                 raise BaseAnchovyException('Expected iterator.')
             # raise exception/wait for finish :)

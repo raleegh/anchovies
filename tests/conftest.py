@@ -32,7 +32,13 @@ class TestDownloader(Downloader):
 
 @fixture
 def session(config_str): 
-    with Session(TestDownloader, anchovy_id='test', anchovy_user='test', config_str=config_str) as ses: 
+    with Session(
+        TestDownloader, 
+        anchovy_id='test', 
+        anchovy_user='test', 
+        config_str=config_str, 
+        stream_queue_size=1,
+    ) as ses: 
         yield ses
 
 
