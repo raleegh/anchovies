@@ -108,6 +108,7 @@ class Dataset(Database, Connection):
 
     def watch_primary_type(self, primary_id: str | tuple, stream: DataStream) -> tuple[tuple, DataStream]: 
         '''Observe the primary types of a table based on 1 row.'''
+        logger.debug(f'watch the primary type for ids {primary_id}...')
         for row in stream: 
             break
         types = list()
@@ -115,9 +116,11 @@ class Dataset(Database, Connection):
             val = row.get(col) 
             if val is None: 
                 raise ValueError(f'A null value was received for {col} in {self} on row {row}.')
-            t = self.db.types.guess(val)
+            t = self.types.guess(val)
             types.append(t)
-        return tuple(types), itertools.chain([row], stream)
+        types = tuple(types)
+        logger.debug(f'discovered {primary_id} as {types}...')
+        return types, itertools.chain([row], stream)
 
 
 class TablePlus(Table): 
@@ -246,6 +249,10 @@ class TablePlus(Table):
                 _type = types.get(name)
                 if _type is None:
                     _type = self.db.types.guess(value)
+                    if _type is None: 
+                        continue
+                if isinstance(_type, str): 
+                    _type = self.db.types.guess(_type)
                 sync_columns[name] = Column(name, _type)
                 out[name] = value
         self.sync_table(sync_columns.values())
@@ -254,6 +261,7 @@ class TablePlus(Table):
 
     def insert_many(self, rows, chunk_size=CHUNKSIZE, sample_size=SAMPLE_SIZE, setup_hook: Callable=0, **kwds) -> int:
         sample_size = sample_size if CHUNKSIZE == -1 else None
+        rows_inserted = 0
         for chunk in chunked_with_ceiling(rows, chunk_size): 
             # Get columns name list to be used for padding later.
             columns, chunk = self.watch_columns(chunk, sample_size=sample_size)
@@ -262,15 +270,19 @@ class TablePlus(Table):
                     setup_hook = type(self).sync_columns
                 setup_hook(self, columns, **kwds)
             try: 
-                return self.insert_bulk(chunk, columns)
+                rows_inserted += self.insert_bulk(chunk, columns)
+                continue
             except NotImplementedError: 
                 logger.warning(f'{type(self)}.insert_bulk() not implemented -> use sqlalchemy')
                 pass
+            logger.debug('Using SQL Alchemy to write to db')
             chunk = self.cleanup(chunk, columns)
             with Session(self.db.executable) as ses, ses.begin(): 
                 chunk = tuple(chunk)
+                rows_inserted += len(chunk)
+                logger.debug(f'Attempt to insert {len(chunk):,} rows')
                 ses.execute(self.table.insert(), chunk)
-                return len(chunk)
+        return rows_inserted
             
     def insert_bulk(self, stream: DataStream, columns: dict=None) -> int: 
         raise NotImplementedError(f'This must be provided')
@@ -360,16 +372,18 @@ class ScdTable(TablePlus):
             self.db.executable.execute(stmt)
             stmt = (
                 tbl.update()
-                    .where(tbl.c._seq.in_(tmp.table))
+                    .where(tbl.c._seq.in_(
+                            select(tmp._table.c._seq)
+                                .subquery()
+                        ))
                     .values(_del=marker)
             ) 
             self.db.executable.execute(stmt)
 
     def drop_expired(self):
         '''Remove records that are expired based on the `deleted_ttl` setting.'''
-        if not (secs := self.deleted_ttl): 
-            return
-        if secs < 0: 
+        secs = self.deleted_ttl
+        if secs is None or secs < 0: 
             return
         marker = (datetime.now().timestamp() - secs) * 1_000_000
         self.delete(_del={'lt': marker})
@@ -418,6 +432,8 @@ class TypesPlus(ABC):
             return self.datetime
         elif isinstance(sample, date):
             return self.date
+        elif sample is None: 
+            return None
         return self.json
 
     def check_type_string(self, dtype): 

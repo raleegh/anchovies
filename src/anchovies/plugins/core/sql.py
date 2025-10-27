@@ -1,14 +1,17 @@
 import logging 
 logger = logging.getLogger(__name__)
-from gevent.lock import RLock as Lock
-from datetime import datetime, UTC
+# from threading import RLock as Lock
+from datetime import datetime, timedelta, UTC
 from anchovies.sdk import Uploader as BaseUploader
 from anchovies.sdk import (
     Connection, ConnectionMemo, Tbl, Task,
-    source, sink, on_task, session, runtime, now, get_config,
+    source, sink, on_task, session, runtime, now, get_config, 
+    getenv, bool_from_str, context,
 )
 from anchovies.plugins.core.dataset import Dataset
-from anchovies.plugins.core.io import DefaultDataBuffer as IOBuff # TODO
+
+
+NO_SCHEMA_NAME = getenv('SQL_NO_SCHEMA_NAME', False, astype=bool_from_str)
 
 
 class SchemaMapper(Connection): 
@@ -40,13 +43,20 @@ class Uploader(BaseUploader):
     db: Dataset = ConnectionMemo(Dataset, disconnected=True)
     # TODO: make sure Dataset() is not initialized by this
     # to customize, all you would have to do is override this :)
-    schemamap = ConnectionMemo(SchemaMapper, env_id='schemas')
+    schemamap = ConnectionMemo(SchemaMapper, env_id='schemas', allow_missing=True)
 
     def __init__(self):
         super().__init__()
         self.schemas = dict()
         self.upload_batch_size = get_config('upload_batch_size', 1024 * 1024 * 8, astype=int)
-        self._wait_for_cleared = Lock()
+        if self.upload_batch_size < 0: 
+            self.upload_batch_size = None
+        logger.info(
+            'SQL upload limited by '
+            + (f'{self.upload_batch_size:,}' if self.upload_batch_size else 'UNLIMITED')
+            + ' bytes'
+        )
+        # self._wait_for_cleared = Lock()
 
     def open(self, tbl): 
         '''Open the default data buffer against a Tbl.'''
@@ -54,16 +64,20 @@ class Uploader(BaseUploader):
 
     def discover_tbls(self):
         waiting = 0
+        tbls = list()
         self.ckpoint = session().datastore.checkpoints
         self.ckpoint.hint('*.timestamp', des=datetime.fromisoformat, ser=datetime.isoformat)
         for tbl in super().discover_tbls(): 
-            ckpoint = self.ckpoint[tbl, 'last.timestamp']
+            ckpoint = self.ckpoint[tbl.qualname, 'last.timestamp']
             with self.open(tbl) as buf: 
-                buf.seek(ckpoint)
+                buf.seek(ckpoint or 0)
                 files = len(buf.readpaths(hint=self.upload_batch_size))
                 logger.info(f'{files:,} waiting for tbl {repr(tbl)}')
                 waiting += files
+                if files: 
+                    tbls.append(tbl)
         self._waiting_file_count = waiting
+        return tbls
 
     @on_task('XOPEN')
     def check_for_work(self, **kwds): 
@@ -80,18 +94,21 @@ class Uploader(BaseUploader):
         '''Customize the default source to stream from the default buffer
         with a data limit.
         '''
-        ckpoint = self.ckpoint[tbl, 'last.timestamp']
+        ckpoint = self.ckpoint[tbl.qualname, 'last.timestamp']
         with self.open(tbl) as buf: 
-            buf.seek(ckpoint)
+            buf.seek(ckpoint or 0)
             stream = buf.read(self.upload_batch_size) 
             yield from stream 
-            with self._wait_for_cleared:
-                last_timestamp = buf.tell()
-                if not last_timestamp.tzinfo: 
-                    last_timestamp = last_timestamp.replace(tzinfo=UTC)
-                lag = round((now() - last_timestamp.astimezone(UTC)).total_seconds() * 1000)
-                ckpoint[tbl, 'last.timestamp'] = last_timestamp
-                task.with_(last_timestamp=last_timestamp, lag=lag)
+        last_timestamp = buf.tell()
+        task.on_success(
+            self.ckpoint.serput, 
+            (tbl.qualname, 'last.timestamp'), 
+            last_timestamp + timedelta(milliseconds=1),
+        )
+        if not last_timestamp.tzinfo: 
+            last_timestamp = last_timestamp.replace(tzinfo=UTC)
+        lag = round((now() - last_timestamp.astimezone(UTC)).total_seconds())
+        task.with_(last_stream_timestamp=last_timestamp, lag=lag)
 
     @sink()
     def sql_sink(self, stream, tbl: Tbl, task: Task, **kwds):
@@ -107,19 +124,30 @@ class Uploader(BaseUploader):
             primary_id=primary_keys, 
             primary_type=primary_type,
             sort_by=tbl.sort_by,
-            ttl=tbl.deleted_ttl,
+            deleted_ttl=tbl.deleted_ttl,
         )
-        with self._wait_for_cleared, dataset:
-            inserts = table.insert_many(stream)
-            task.with_(inserts=inserts)
-            # TODO: add threading??? ++general performance testing
+        insert_kwds = {}
+        if tbl.cols: 
+            insert_kwds['types'] = dict(tbl.cols)
+        with dataset:
+            inserts = table.insert_many(stream, **insert_kwds)
+        task.with_(inserts=inserts)
+        # TODO: add threading??? ++general performance testing
 
     def resolve_schema(self, name: str): 
-        return self.schemamap.translate(name)
+        '''Append anchovy context to schema name if not in prod.'''
+        name = self.schemamap.translate(name)
+        if context().anchovy_user != get_config('sql_prod_user', 'prod'): 
+            name + '__' + context().anchovy_user
+        return name
+    # TODO: append env if not prod :)
     
     def get_or_connect_schema(self, schema: str) -> Dataset: 
         if cnxn := self.schemas.get(schema): 
             return cnxn
-        cnxn = self.connections.get_or_set('db', schema=schema) #TODO
+        kwds = dict(schema=schema)
+        if NO_SCHEMA_NAME: 
+            del kwds['schema']
+        cnxn = self.connections.get_or_set('db', **kwds)
         self.schemas[schema] = cnxn 
         return cnxn

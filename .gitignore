@@ -18,6 +18,7 @@ uv.lock
 .vscode
 .coverage
 .data/
+.debug/
 
 # mac data file
 .DS_STORE

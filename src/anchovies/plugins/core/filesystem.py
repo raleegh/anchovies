@@ -71,7 +71,7 @@ class FilesystemDatastore(Datastore):
             stream = filter(lambda path: self.st_mtime(path) < before, stream)
         prefix = str(self.root_dir_abs) + '/'
         stream = map(lambda p: p.removeprefix(prefix), stream)
-        yield from stream
+        yield from sorted(stream)
 
     def st_mtime(self, path): 
         x = datetime.fromtimestamp(

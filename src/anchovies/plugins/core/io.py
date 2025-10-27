@@ -1,12 +1,19 @@
 import json
 import gzip
 import uuid
+import logging; logger = logging.getLogger(__name__)
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from datetime import datetime, date, timedelta, UTC
 from pytz import timezone
 from typing import Iterator
 from anchovies.sdk import Datastore, Tbl, Task, now, context, cached, get_config
+
+
+def not_naive_ts(dt: datetime): 
+    if dt.tzinfo is None: 
+        dt = timezone('UTC').localize(dt)
+    return dt 
 
 
 class BaseDataBuffer(ABC):
@@ -34,17 +41,36 @@ class BaseDataBuffer(ABC):
         '''Check if the stream is seekable.'''
         ...
 
-    def seek(self, offset: datetime | timedelta, whence: datetime=None) -> None: 
+    def seek(self, offset: datetime | timedelta | int, whence: datetime=None) -> None: 
         '''Provide offset (and whence) to adjust the stream position.'''
         assert self.seekable()
+        if isinstance(offset, int): 
+            assert offset in {0, -1}, 'Can only provide offsets (0, -1).'
+            if offset == -1: 
+                return self.seek_end()
+            return self.seek_start()
         if whence: 
             assert isinstance(offset, timedelta), \
                 'When using "whence", "offset" must be a timedelta.'
-            self.position = whence
+            self.position = not_naive_ts(whence)
         if isinstance(offset, datetime): 
-            self.position = offset
+            self.position = not_naive_ts(offset)
             return
         self.position += offset
+
+    @abstractmethod
+    def seek_start(self): 
+        '''When the user requests "START" of stream with position-0, 
+        navigate to the first datetime.
+        '''
+        ...
+
+    @abstractmethod
+    def seek_end(self): 
+        '''When the user requests "START" of stream with position-0, 
+        navigate to the first datetime.
+        '''
+        ...
     
     def tell(self): 
         '''Reveal the stream position.'''
@@ -102,12 +128,13 @@ class FileDataBuffer(BaseDataBuffer):
     def __init__(self, path: str):
         super().__init__()
         self._path = path
+        self._current_path = None
 
     def pathable(self):
         return True
     
     def tellpath(self): 
-        return self._path
+        return self._current_path or self._path
     
 
 class GzipJsonBuffer(FileDataBuffer): 
@@ -122,6 +149,12 @@ class GzipJsonBuffer(FileDataBuffer):
 
     def seekable(self):
         return False
+    
+    def seek_start(self):
+        raise NotImplementedError('Not supported. Stream not seekable.')
+
+    def seek_end(self):
+        raise NotImplementedError('Not supported. Stream not seekable.')
 
     def write(self, line):
         self.check_write()
@@ -151,6 +184,7 @@ class GzipJsonBuffer(FileDataBuffer):
 
     def read(self, hint = -1):
         self.check_read()
+        logger.debug(f'read from {self._path}')
         with self.db.open(self._path, 'rb') as buf, gzip.open(buf, 'rt') as buf: 
             for line in buf.readlines(): 
                 yield json.loads(line)
@@ -200,7 +234,9 @@ class TypedJsonBuffer(GzipJsonBuffer):
 
     def from_annotated(self, line: dict) -> dict: 
         '''Check the "_types" attribute to serialize.'''
-        types = self.break_annotation(line.pop('_types', ''))
+        types = tuple(self.break_annotation(line.pop('_types', '')))
+        if not types: 
+            return line
         for col, typ in types: 
             if typ == 'D': 
                 line[col] = date.fromisoformat(line[col])
@@ -216,7 +252,10 @@ class TypedJsonBuffer(GzipJsonBuffer):
 
     @staticmethod
     def break_annotation(t): 
-        yield from (tuple(s.split('@')) for s in t.split(' '))
+        notes = tuple(s.split('@') for s in t.split(' '))
+        for note in notes:
+            if len(note) == 2: 
+                yield note
 
 
 class NaivePathBuffer(FileDataBuffer): 
@@ -237,10 +276,24 @@ class NaivePathBuffer(FileDataBuffer):
         self._stack = ExitStack()
 
     def __hash__(self):
-        return hash((self.anchovy_id, self._path, self.datastore.original_path))
+        return hash((
+            self.anchovy_id, 
+            hash(self._path), 
+            self.datastore.original_path
+        ))
 
     def seekable(self):
         return True 
+    
+    def seek_start(self):
+        self.position = datetime(2001, 1, 1, tzinfo=UTC)
+        for path in self.readpaths(1): 
+            break
+
+    def seek_end(self): 
+        self.position = datetime(2001, 1, 1, tzinfo=UTC)
+        for path in self.readpaths(-1): 
+            ...
     
     def make_data_path(self, extra: str=None): 
         '''Build the Anchovies data path.
@@ -275,17 +328,23 @@ class NaivePathBuffer(FileDataBuffer):
             after = self.tell()
             path = self.make_data_path()
             for path in self.db.list_files(path, after=after): 
-                self._path = path
+                self._current_path = path
                 info = self.db.describe(path)
-                self._position = info.modified_at
+                self.position = info.modified_at
                 total_read += info.size
                 yield path
                 if hint > 1 and total_read > hint: 
+                    logger.debug(
+                        f'Hit read size limit @ {total_read:,}'
+                        f' bytes (limit={hint:,})'
+                    )
                     break
         return tuple(generate())
     
     def read(self, hint=-1):
         for path in self.readpaths(hint): 
+            self.position = self.db.describe(path).modified_at
+            self._current_path = path
             self.make_buffer(path)
             yield from self._buf
 
@@ -341,23 +400,33 @@ class DatetimePathBuffer(NaivePathBuffer):
     
     Because the path must have the day in the prefix, we can more intelligently 
     scan over files associated to the buffer.
-    '''
+    '''   
+    def seek_start(self):
+        self.position = datetime(2001, 1, 1, tzinfo=UTC)
+        for path in super().readpaths(1): 
+            break
+
+    def seek_end(self): 
+        self.position = now()
+        for path in super().readpaths(0): 
+            ...
+
     @cached('io.readpaths', ttl_hook=lambda: get_config('io_cache_ttl', 60 * 10, astype=int))
     def readpaths(self, hint = -1):
         def generate():
             total_read = 0
-            until = now()
+            until = now() + timedelta(days=1) # easiest way to make this work as expected
             today = after = self.tell()
             while today <= until: 
                 date_part = today.strftime('%Y%m%d')
                 path = self.make_data_path(date_part)
                 for path in self.db.list_files(path, after=after): 
-                    self._path = path
+                    self._current_path = path
                     info = self.db.describe(path)
-                    self._position = info.modified_at
+                    self.position = info.modified_at
                     total_read += info.size
                     yield path
-                    if hint > 1 and total_read > hint: 
+                    if hint > 0 and total_read > hint: 
                         break
                 today += timedelta(days=1)
         return tuple(generate())
@@ -428,6 +497,14 @@ class StatisticsBuffer(DatetimePathBuffer):
             last_data_change_timestamp=self._stats_last_data_change_timestamp,
             lag=lag,
         )
+        logger.debug(
+            f'buffer statistics for {self.tbl} '
+            f'size={self._stats_written_bytes:,} '
+            f'rows={self._stats_row_count:,} '
+            f'data change date={self._stats_last_data_change_timestamp.isoformat(" ")} '
+            f'lag (seconds)={lag:,}'
+        )
+        
 
 
 # save for export

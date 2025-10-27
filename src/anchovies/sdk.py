@@ -182,11 +182,13 @@ def cached(key_prefix: str, *, ttl: float=-1, ttl_hook: Callable=None):
         def cached_func(*args, **kwds): 
             cache = session().datastore.cache
             key = cache.make_key(*args, **kwds)
-            if result := cache.get(key_prefix=key_prefix, key=key): 
-                return result
-            result = func(*args, **kwds)
-            ttl = resolve_ttl()
-            return cache.get_or_set(key_prefix=key_prefix, key=key, value=result, ttl=ttl)
+            return cache.get_or_set(
+                key_prefix=key_prefix, 
+                key=key, 
+                on_miss=func,
+                on_miss_args=args, 
+                on_miss_kwds=kwds, 
+                ttl_callback=resolve_ttl,)
         return cached_func
     return decorator
 
@@ -355,6 +357,7 @@ class Tbl:
     ): 
         self.name = name
         self.namespace = namespace
+        self.resolve_namespace()
         self.cols = Cols(cols) or Cols()
         self.unique_by = ColSelect(unique_by) or ColSelect()
         self.set_by = ColSelect(set_by) or ColSelect()
@@ -368,6 +371,17 @@ class Tbl:
 
     def __repr__(self):
         return f'`{self.qualname}`'
+    
+    def __hash__(self):
+        return hash(self.qualname)
+    
+    def resolve_namespace(self): 
+        '''If the table name has a namespace, move that to namespace.'''
+        # TODO: better name resolution
+        if '.' not in self.name: 
+            return
+        namespace, name = self.name.split('.')
+        self.namespace, self.name = namespace, name 
 
     @property
     def qualname(self): 
@@ -397,6 +411,8 @@ class Tbl:
             'unique_by': str(self.unique_by),
             'set_by': str(self.set_by),
             'sort_by': str(self.sort_by),
+            'deleted_ttl': self.deleted_ttl, 
+            'data_change_timestamp_field': self.data_change_timestamp_field,
             **self.properties,
         }
     
@@ -409,11 +425,15 @@ class Tbl:
         for name, attr in inspect.getmembers(other): 
             if name.startswith('_'): 
                 continue
-            if attr:
-                try:    
-                    setattr(new, name, attr)
-                except AttributeError: 
-                    pass # is property
+            current_attr = getattr(new, name)
+            if attr is None: 
+                continue
+            if current_attr is not None and not attr: 
+                continue
+            try:    
+                setattr(new, name, attr)
+            except AttributeError: 
+                pass # is property
         # special combines
         new.properties.update(**other.properties)
         return new
@@ -443,7 +463,7 @@ class TblSet(UserDict):
 
     def add(self, other: Tbl):
         if existing := self.data.get(other.qualname): 
-            other = other.merge(existing)
+            other = existing.merge(other)
         self.data[other.qualname] = other
 
     def extend(self, other: 'TblSet'): 
@@ -458,13 +478,9 @@ class TblSet(UserDict):
         '''
         new = type(self)(self)
         for tbl in new.values(): 
-            tbl = deepcopy(tbl)
-            if ltbl := other.get(str(tbl)): 
-                tbl = tbl.with_(ltbl)
+            # tbl = deepcopy(tbl)
             self.add(tbl)
         for tbl in other.values(): 
-            if tbl in new: 
-                continue
             new.add(tbl)
         return new
     # TODO: extend behavior correctly
@@ -1290,10 +1306,18 @@ class ConnectionMemo:
         conn = ConnectionMemo(connect)
     ```
     '''
-    def __init__(self, cls: type, *, disconnected=False, env_id: str=None): 
+    def __init__(
+        self, 
+        cls: type, 
+        *, 
+        disconnected=False, 
+        env_id: str=None,
+        allow_missing=False,
+    ): 
         self.cls = cls
         self.disconnected = disconnected
         self.env_id = env_id
+        self.allow_missing = allow_missing
 
     def __call__(self, *args, **kwds):
         return self.cls(*args, **kwds)
@@ -1306,7 +1330,7 @@ class ConnectionFairy:
     '''
     def __init__(self, operator: Downloader): 
         self.operator = self.op = operator
-        self.ids = dict(self.find_cnxn_annotations())
+        self.ids: dict[str, ConnectionMemo] = dict(self.find_cnxn_annotations())
         self.data = dict()
         self._cm_stack = ExitStack()
 
@@ -1329,7 +1353,7 @@ class ConnectionFairy:
     def close(self): 
         self._cm_stack.close()
 
-    def find_cnxn_annotations(self) -> tuple[str, type[Connection]]: 
+    def find_cnxn_annotations(self): 
         suspected_cnxns = list()
         for attr, annotation in inspect.get_annotations(self.op.__class__).items(): 
             if issubclass(annotation, Connection):
@@ -1349,10 +1373,11 @@ class ConnectionFairy:
         '''Retrieve an open connection or create it new!'''
         attrs = dict(self.find_args_for_cnxn(id))
         if not attrs: 
-            raise AnchovyMissingConnection(
-                f'{self.op.__class__} was expecting '
-                f'connection with id {id}!'
-            )
+            if not self.ids[id].allow_missing: 
+                raise AnchovyMissingConnection(
+                    f'{self.op.__class__} was expecting '
+                    f'connection with id {id}!'
+                )
         cnxn = self.ids[id](**attrs, **cnxn_settings)
         self.attach(id, cnxn)
         return cnxn
@@ -1576,7 +1601,7 @@ class Metastore(ABC):
         if not path: 
             raise BrokenConfig('Unplanned scenario')
             #TODO: what should be done when no path?
-        return (path.strip('/') + '/' + '/'.join(paths)).strip('/')
+        return (path.strip('/') + '/' + '/'.join(map(str, paths))).strip('/')
     
     def anchovy_home(self, *paths): 
         '''Return the relative path for the active anchovy.'''
@@ -1815,22 +1840,25 @@ class BaseCheckpoint(Microservice):
 
     def desget(self, key, **kwds):
         '''Get a specific checkpoint & deserialize.'''
+        key = self.make_key(key)
         des = self.get_des(key)
-        return des(self.get(key, **kwds))
+        val = self.get(key, **kwds)
+        if not val: 
+            return None
+        return des(val)
     
     def serput(self, key, data, **kwds): 
         '''Update a specific checkpoint & serialize.'''
+        key = self.make_key(key)
         ser = self.get_ser(key)
         return self.put(key, ser(data), **kwds)
 
     def __getitem__(self, key):
         '''Get a specific checkpoint & deserialize.'''
-        key = self.make_key(key)
         return self.desget(key)
     
     def __setitem__(self, key, data): 
         '''Update a specific checkpoint & serialize.'''
-        key = self.make_key(key)
         return self.serput(key, data)
     
     def __delitem__(self, key): 
@@ -1900,6 +1928,7 @@ class CachedCheckpoint(Checkpoint):
         return val
     
     def put(self, key, data): 
+        debug(f'Checkpoint "{key}" advanced to {data}')
         self.data[key] = data
         self._changed.add(key)
 
@@ -1986,11 +2015,11 @@ class TaskStore(Microservice):
     def maybe_make_task(self, *args, **kwds):
         '''Get a new task or return the already running task.'''
         task = runtime().Task.allowing_overflow(*args, **kwds)
-        if task.task_key not in self.running_tasks:
-            self.running_tasks[task.task_key] = task
+        if task not in self.running_tasks:
+            self.running_tasks[task] = task
             task._task_store = self
             task.start()
-        return self.running_tasks[task.task_key]
+        return self.running_tasks[task]
 
 
 class NothingTaskStore(TaskStore): 
@@ -2081,6 +2110,7 @@ class Task(BaseTaskDataMixin):
         self._lock = th.RLock()
         self._links = list()
         self._task_store = None
+        self._callbacks = list()
 
     def __str__(self): 
         label = str(self.task_type)
@@ -2102,10 +2132,15 @@ class Task(BaseTaskDataMixin):
     def task_key(self): 
         if self.task_type not in {'ERR', 'TBL'}: 
             return self.task_type
-        return '-'.join((self.task_type, str(self.tbl)))
+        return '-'.join((self.task_type, self.tbl.qualname))
     
     def __hash__(self):
         return hash(self.task_key)
+    
+    def __eq__(self, other): 
+        if not isinstance(other, Task): 
+            return False 
+        return hash(self) == hash(other)
 
     @staticmethod
     def get_thread_id(): 
@@ -2168,6 +2203,7 @@ class Task(BaseTaskDataMixin):
             except Exception as e: 
                 raise TaskCallbackFailedWarning(e) from e
                 # TODO: will this suffice
+        self.run_task_callbacks()
         try:
             self.completed_at = now()
             if context().batch_id and not self.batch_id: 
@@ -2193,7 +2229,7 @@ class Task(BaseTaskDataMixin):
             self.mark_done()
             raise
         if self._task_store:
-            del self._task_store.running_tasks[self.task_key]
+            del self._task_store.running_tasks[self]
 
     def maybe_send(self): 
         '''Send the task if no links are waiting.'''
@@ -2274,6 +2310,19 @@ class Task(BaseTaskDataMixin):
         info = self.info()
         return json.dumps(info, default=AnchoviesEncoder().default)
     
+    def run_task_callbacks(self): 
+        '''Run callbacks attached to the task itself.'''
+        wanted_types = {'on_success', 'on_error', 'on_complete'}
+        if not sys.exc_info()[0]: 
+            wanted_types = {'on_success', 'on_complete'}
+        callbacks = filter(lambda c: c[0] in wanted_types, self._callbacks)
+        for cb in callbacks: 
+            cb[1](*cb[2], **cb[3])
+    
+    def on_success(self, callback, *args, **kwds):
+        '''Add an on success callback to the task.'''
+        self._callbacks.append(('on_success', callback, args, kwds))
+    
 
 class TaskLink(BaseTaskDataMixin):
     def __init__(self, task: Task):
@@ -2320,6 +2369,10 @@ class TaskLink(BaseTaskDataMixin):
     
     def __exit__(self, *args): 
         return self.send()
+    
+    def on_success(self, callback, *args, **kwds):
+        '''Add an on-success callback to the Task.'''
+        return self.task.on_success(callback, *args, **kwds)
 
 
 def on_task(task_name: TaskTypeT): 
@@ -2496,8 +2549,26 @@ class Cache(Microservice):
     def get(self, key: str, *, key_prefix: str=None) -> Any:
         return self.check_ttl(self.prefix(key_prefix).get(key))
 
-    def get_or_set(self, key: str, value: Any=None, *, key_prefix: str=None, ttl: int=-1) -> Any:
+    def get_or_set(
+            self, 
+            key: str, 
+            value: Any=None, 
+            *, 
+            key_prefix: str=None, 
+            ttl: int=-1,
+            ttl_callback: Callable=None,
+            on_miss: Callable=None, 
+            on_miss_args=(),
+            on_miss_kwds: dict=None,
+        ) -> Any:
         '''Set a value in the cache and retrieve.'''
+        on_miss_kwds = on_miss_kwds or dict()
+        key = self.make_key(key)
+        if hit := self.get(key): 
+            return hit
+        if ttl_callback is not None: 
+            ttl = ttl_callback()
+        value = on_miss(*on_miss_args or (), **on_miss_kwds)
         self.prefix(key_prefix)[key] = self.add_ttl(value, ttl)
         return value
     
@@ -2525,7 +2596,7 @@ class Cache(Microservice):
     
     def make_key(self, *args, **kwds): 
         named_args = tuple((k, v) for k,v in kwds.items())
-        return hash((*args, *named_args))
+        return (*args, *named_args)
 
 
 class ResultStore(Microservice): 
