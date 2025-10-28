@@ -501,8 +501,8 @@ class StatisticsBuffer(DatetimePathBuffer):
             f'buffer statistics for {self.tbl} '
             f'size={self._stats_written_bytes:,} '
             f'rows={self._stats_row_count:,} '
-            f'data change date={self._stats_last_data_change_timestamp.isoformat(" ")} '
-            f'lag (seconds)={lag:,}'
+            f'data change date={self._stats_last_data_change_timestamp} '
+            f'lag (seconds)={lag or 0:,}'
         )
         
 
