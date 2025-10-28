@@ -333,12 +333,12 @@ class NaivePathBuffer(FileDataBuffer):
                 self.position = info.modified_at
                 total_read += info.size
                 yield path
-                if hint > 1 and total_read > hint: 
+                if hint > 0 and total_read > hint: 
                     logger.debug(
                         f'Hit read size limit @ {total_read:,}'
                         f' bytes (limit={hint:,})'
                     )
-                    break
+                    return
         return tuple(generate())
     
     def read(self, hint=-1):
@@ -427,7 +427,7 @@ class DatetimePathBuffer(NaivePathBuffer):
                     total_read += info.size
                     yield path
                     if hint > 0 and total_read > hint: 
-                        break
+                        return
                 today += timedelta(days=1)
         return tuple(generate())
 

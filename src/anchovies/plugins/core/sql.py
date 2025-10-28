@@ -138,7 +138,7 @@ class Uploader(BaseUploader):
         '''Append anchovy context to schema name if not in prod.'''
         name = self.schemamap.translate(name)
         if context().anchovy_user != get_config('sql_prod_user', 'prod'): 
-            name + '__' + context().anchovy_user
+            name = name + '__' + context().anchovy_user
         return name
     # TODO: append env if not prod :)
     
