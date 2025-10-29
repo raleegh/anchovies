@@ -477,7 +477,7 @@ class StatisticsBuffer(DatetimePathBuffer):
                 val = self._timezone.localize(val)
             if self._stats_last_data_change_timestamp: 
                 val = max(val, self._stats_last_data_change_timestamp)
-                self._stats_last_data_change_timestamp = val
+            self._stats_last_data_change_timestamp = val
 
     def close(self): 
         super().close()

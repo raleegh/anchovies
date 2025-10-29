@@ -2132,7 +2132,9 @@ class Task(BaseTaskDataMixin):
     def task_key(self): 
         if self.task_type not in {'ERR', 'TBL'}: 
             return self.task_type
-        return '-'.join((self.task_type, self.tbl.qualname))
+        if self.tbl: 
+            return '-'.join((self.task_type, self.tbl.qualname))
+        return self.task_type
     
     def __hash__(self):
         return hash(self.task_key)
