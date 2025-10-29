@@ -1,6 +1,6 @@
 [project]
 name = "anchovies"
-version = "0.0.0a1"
+version = "0.0.0a2"
 description = "a lightweight ETL library"
 readme = "README.md"
 requires-python = ">=3.12"
