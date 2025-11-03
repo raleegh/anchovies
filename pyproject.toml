@@ -1,11 +1,13 @@
 [project]
 name = "anchovies"
-version = "0.0.0a2"
+version = "0.0.0a3"
 description = "a lightweight ETL library"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.3.0",
+    "isal>=1.8.0",
+    "orjson>=3.11.4",
     "prettytable>=3.16.0",
     "python-dateutil>=2.9.0.post0",
     "pytz>=2025.2",

@@ -1,7 +1,10 @@
-import json
-import gzip
 import uuid
 import logging; logger = logging.getLogger(__name__)
+import concurrent.futures as cf
+import atexit
+import orjson as json
+import isal.igzip_threaded as gzip
+import io
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from datetime import datetime, date, timedelta, UTC
@@ -14,6 +17,10 @@ def not_naive_ts(dt: datetime):
     if dt.tzinfo is None: 
         dt = timezone('UTC').localize(dt)
     return dt 
+
+
+pool = cf.ThreadPoolExecutor()
+atexit.register(pool.shutdown)
 
 
 class BaseDataBuffer(ABC):
@@ -143,7 +150,7 @@ class GzipJsonBuffer(FileDataBuffer):
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         self._writeable, self._readable = False, False 
-        self._compression_factor = 0.20
+        self._compression_factor = 0.2
         self._buf = None
         self._stack = ExitStack()
 
@@ -158,9 +165,10 @@ class GzipJsonBuffer(FileDataBuffer):
 
     def write(self, line):
         self.check_write()
-        json.dump(line, self._buf)
-        self._buf.write('\n')
-        return round(len(str(line)) * self._compression_factor)  # approximation of write size
+        raw = json.dumps(line) + b'\n'
+        self._buf.write(raw)
+        return round(len(raw) * self._compression_factor)  
+        # approximation of write size
     
     def writable(self):
         return self._writeable
@@ -173,7 +181,7 @@ class GzipJsonBuffer(FileDataBuffer):
 
     def make_buffer(self): 
         buf = self.db.open(self._path, 'wb')
-        buf = gzip.open(buf, 'wt')
+        buf = gzip.open(buf, 'wb', threads=4)
         self._buf = self._stack.enter_context(buf)
 
     def __exit__(self, *args):
@@ -185,7 +193,11 @@ class GzipJsonBuffer(FileDataBuffer):
     def read(self, hint = -1):
         self.check_read()
         logger.debug(f'read from {self._path}')
-        with self.db.open(self._path, 'rb') as buf, gzip.open(buf, 'rt') as buf: 
+        with (
+                self.db.open(self._path, 'rb') as buf,
+                gzip.open(buf, 'rb') as buf,
+                io.TextIOWrapper(buf, encoding='utf-8') as buf
+        ): 
             for line in buf.readlines(): 
                 yield json.loads(line)
 
@@ -274,6 +286,7 @@ class NaivePathBuffer(FileDataBuffer):
         self._buffer_cls = TypedJsonBuffer
         self._buf = None
         self._stack = ExitStack()
+        self.__futures = set()
 
     def __hash__(self):
         return hash((
@@ -375,8 +388,9 @@ class NaivePathBuffer(FileDataBuffer):
         return self._written_bytes > self.desired_file_size
     
     def flush(self): 
+        self.promise_futures()
         stack, self._buf = self._stack, None 
-        stack.close()
+        self.__futures.add(pool.submit(stack.close))
         self._stack = ExitStack()
 
     def maybe_flush(self): 
@@ -390,9 +404,15 @@ class NaivePathBuffer(FileDataBuffer):
 
     def __exit__(self, *args):
         self.flush()
+        self.promise_futures()
         return super().__exit__(*args)
         # TODO: would like to add threading to do background tasks & concurrency
         # TODO: during an error, leaves a bad file
+
+    def promise_futures(self):
+        for fut in cf.as_completed(self.__futures): 
+            fut.result()
+            self.__futures.remove(fut)
 
 
 class DatetimePathBuffer(NaivePathBuffer): 

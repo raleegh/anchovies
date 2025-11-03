@@ -38,6 +38,7 @@ def session(config_str):
         anchovy_user='test', 
         config_str=config_str, 
         stream_queue_size=1,
+        stream_chunk_size=1,
     ) as ses: 
         yield ses
 
