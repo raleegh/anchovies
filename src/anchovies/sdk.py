@@ -567,7 +567,7 @@ class IterQueue(Queue):
                 self.task_done()
                 backoff = 0
             except Empty: 
-                time.sleep(0.01 * (2 ** backoff))
+                self.should_stop.wait(0.01 * (2 ** backoff))
                 backoff = min(backoff + 1, 10)
     
     def stop(self): 
@@ -1249,8 +1249,7 @@ class Overseer:
 
     def monitor_running_streams(self):
         '''Periodically check running streams for health.'''
-        while not self.should_stop.is_set(): 
-            time.sleep(6)
+        while not self.should_stop.wait(6): 
             with self.mutex:
                 for stream in self.running_streams: 
                     self.__monitor_source_stream(stream)
@@ -2081,8 +2080,9 @@ class TaskStore(Microservice):
 
     def send(self, task: 'Task'): 
         '''Send a task to the storage location.'''
-        path = self.new_path()
-        self.db.write(path, task.dump())
+        with self._lock:
+            path = self.new_path()
+            self.db.write(path, task.dump())
 
     def new_path(self, key=None):
         '''Generate a new path like `$task_logs/YYYmmdd<...>.json`.'''
@@ -2094,11 +2094,12 @@ class TaskStore(Microservice):
     def maybe_make_task(self, *args, **kwds):
         '''Get a new task or return the already running task.'''
         task = runtime().Task.allowing_overflow(*args, **kwds)
-        if task not in self.running_tasks:
-            self.running_tasks[task] = task
-            task._task_store = self
-            task.start()
-        return self.running_tasks[task]
+        with self._lock:
+            if task not in self.running_tasks:
+                self.running_tasks[task] = task
+                task._task_store = self
+                task.start()
+            return self.running_tasks[task]
 
 
 class NothingTaskStore(TaskStore): 
@@ -2310,7 +2311,9 @@ class Task(BaseTaskDataMixin):
             self.mark_done()
             raise
         if self._task_store:
-            del self._task_store.running_tasks[self]
+            with self._task_store._lock:
+                if self in self._task_store.running_tasks:
+                    del self._task_store.running_tasks[self]
 
     def maybe_send(self): 
         '''Send the task if no links are waiting.'''
@@ -2437,10 +2440,9 @@ class TaskLink(BaseTaskDataMixin):
         return data
     
     def send(self): 
-        ...
-        self.task.with_(self.data)
-        self.task.maybe_convert_to_exception()
         with self.task._lock:
+            self.task.with_(self.data)
+            self.task.maybe_convert_to_exception()
             self.task.thread_id = self.task.get_thread_id()
             self.task._links.remove(self)
             self.task.maybe_send()
