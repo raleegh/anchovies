@@ -2,6 +2,8 @@ import json
 import gzip
 import uuid
 import logging; logger = logging.getLogger(__name__)
+import concurrent.futures as cf
+import atexit
 from abc import ABC, abstractmethod
 from contextlib import ExitStack
 from datetime import datetime, date, timedelta, UTC
@@ -14,6 +16,10 @@ def not_naive_ts(dt: datetime):
     if dt.tzinfo is None: 
         dt = timezone('UTC').localize(dt)
     return dt 
+
+
+pool = cf.ThreadPoolExecutor()
+atexit.register(pool.shutdown)
 
 
 class BaseDataBuffer(ABC):
@@ -143,7 +149,7 @@ class GzipJsonBuffer(FileDataBuffer):
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         self._writeable, self._readable = False, False 
-        self._compression_factor = 0.20
+        self._compression_factor = 0.10
         self._buf = None
         self._stack = ExitStack()
 
@@ -274,6 +280,7 @@ class NaivePathBuffer(FileDataBuffer):
         self._buffer_cls = TypedJsonBuffer
         self._buf = None
         self._stack = ExitStack()
+        self.__futures = set()
 
     def __hash__(self):
         return hash((
@@ -375,8 +382,9 @@ class NaivePathBuffer(FileDataBuffer):
         return self._written_bytes > self.desired_file_size
     
     def flush(self): 
+        self.promise_futures()
         stack, self._buf = self._stack, None 
-        stack.close()
+        self.__futures.add(pool.submit(stack.close))
         self._stack = ExitStack()
 
     def maybe_flush(self): 
@@ -390,9 +398,15 @@ class NaivePathBuffer(FileDataBuffer):
 
     def __exit__(self, *args):
         self.flush()
+        self.promise_futures()
         return super().__exit__(*args)
         # TODO: would like to add threading to do background tasks & concurrency
         # TODO: during an error, leaves a bad file
+
+    def promise_futures(self):
+        for fut in cf.as_completed(self.__futures): 
+            fut.result()
+            self.__futures.remove(fut)
 
 
 class DatetimePathBuffer(NaivePathBuffer): 

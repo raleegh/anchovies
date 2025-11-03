@@ -13,6 +13,7 @@ import importlib
 import time
 import atexit
 import uuid
+import itertools
 from abc import ABC, abstractmethod
 from collections import UserDict, UserList, namedtuple, deque
 from contextlib import ExitStack
@@ -21,7 +22,7 @@ from typing import cast, Any, Literal, Iterator, Callable, Sequence
 from functools import cache as memoize
 from functools import cached_property as memoprop
 from datetime import datetime, UTC
-from copy import copy, deepcopy
+from copy import copy
 from queue import Queue, Empty, Full
 
 import yaml
@@ -581,6 +582,18 @@ class IterQueue(Queue):
                 pass
 
 
+def chunked(iterable, n, *, strict=False):
+    '''`chunked('ABCDEFG', 2) → AB CD EF G`'''
+    # https://docs.python.org/3/library/itertools.html#itertools.batched
+    if n < 1:
+        raise ValueError('n must be at least one')
+    iterator = iter(iterable)
+    while batch := tuple(itertools.islice(iterator, n)):
+        if strict and len(batch) != n:
+            raise ValueError('chunked(): incomplete batch')
+        yield batch
+
+
 class Stream:
     '''
     A stream is the base unit of the source/sink apparatus 
@@ -610,6 +623,9 @@ class Stream:
         self._id = str(uuid.uuid4())
         self._saved_outermost = None
         self.overseer: 'Overseer' = None
+        self.replica_count = 1
+        self.replica_number = 1
+        self.replica_of = None
 
     def __str__(self): 
         return self.tbl_wildcard
@@ -639,7 +655,7 @@ class Stream:
     # * is there an option that can use gevent/async
 
     def __iter__(self): 
-        yield from self._stream
+        yield from itertools.chain.from_iterable(self._stream)
 
     def iter_rows(self, *args, **kwds):
         '''Iterate in sync with the should stop signal.''' 
@@ -649,6 +665,11 @@ class Stream:
                 yield next(it)
             except StopIteration: 
                 break
+
+    def iter_chunks(self, chunk_size: int=None, *args, **kwds):
+        '''Iterate in chunks of rows.'''
+        chunk_size = chunk_size or get_config('stream_chunk_size', 2000, astype=int)
+        yield from chunked(self.iter_rows(*args, **kwds), chunk_size)
 
     def schedule_stream(self, **stream_kwds): 
         '''Entry-point function to set-up the streaming chain.'''
@@ -751,7 +772,6 @@ class Stream:
             cur = outer
         return ret
     
-    # @memoize
     def maybe_outer(self) -> 'Stream': 
         stream = self.outer() or self
         return stream.clone()
@@ -791,7 +811,6 @@ class Stream:
             yield maybe_substream
             maybe_substream = maybe_substream.func
 
-    # @memoize
     def resolve_stream_callable(self): 
         answer = self.func 
         for sub in self.get_substreams(): 
@@ -816,8 +835,10 @@ class Stream:
                 continue
             self.included.add(maybe_include)
 
-    def clone(self, new_name: str=None):
+    def clone(self, new_name: str=None, fresh: bool=False) -> 'Stream':
         new = copy(self)
+        if fresh: 
+            new._id = str(uuid.uuid4())
         new.tbl_wildcard = new_name or new.tbl_wildcard
         new._saved_outermost = None
         new._stream = None
@@ -863,32 +884,39 @@ class SourceStream(Stream):
         return f'@source(`{self.tbl_wildcard}`)'
     
     def actually_run_as_stream(self, **kwds):
+        if not (
+            hasattr(self.resolve_stream_callable(), '__iter__')
+            or inspect.isgeneratorfunction(self.resolve_stream_callable())
+        ):
+            raise BaseAnchovyException('Expected iterator.')
         kwds = self._prepare_actually_run_as_stream(**kwds)
         self.futures = cast(list[th.Thread], list())
         for sink in self._sinks:
             # sink.attach_leader(self.leader or self) 
             self.futures.append(sink.promise(self))
-        # running the stream
+        # "precompute" sinks
+        sinks = tuple(s.outermost_for_scheduling()._stream.put for s in self._sinks)
         try:
-            # when iterator
-            if hasattr(self.resolve_stream_callable(), '__iter__') \
-                    or inspect.isgeneratorfunction(self.resolve_stream_callable()):
-                # "precompute" sinks
-                sinks = tuple(s.outermost_for_scheduling()._stream.put for s in self._sinks)
-                for i in self.iter_rows(**kwds): 
+            if len(sinks) == 1:
+                self.run_single_sink(sinks[0], **kwds)
+            else:
+                for i in self.iter_chunks(**kwds): 
                     for sink in sinks: 
                         sink(copy(i))
                 for sink in sinks:
                     debug(f'Forward end of stream to {sink}')
                     sink(StopIteration)
-            else:
-                raise BaseAnchovyException('Expected iterator.')
-            # raise exception/wait for finish :)
             for fut in self.futures: 
                 fut.join()
         except BaseException:
             self.should_stop.set()
             raise
+
+    def run_single_sink(self, ptfn: Callable, **kwds):
+        '''Because a single sink is common, optimize for it.'''
+        deque(map(ptfn, map(copy, self.iter_chunks(**kwds))), maxlen=1)
+        debug(f'Forward end of stream to {ptfn}')
+        ptfn(StopIteration)
 
     def _prepare_actually_run_as_stream(self, **kwds):
         if 'source' not in kwds:
@@ -966,10 +994,13 @@ class SourceStream(Stream):
 
 class SinkStream(Stream): 
     '''A streaming component that RECEIVES data.'''
-    def __init__(self, tbl_wildcard, func):
+    def __init__(self, tbl_wildcard, func, replica_count=1):
         if isinstance(func, SourceStream): 
             raise SyntaxError(f'A @sink cant decorate a @source {func}!')
         super().__init__(tbl_wildcard, func)
+        if callable(replica_count):
+            replica_count = replica_count()
+        self.replica_count = replica_count
 
     def __repr__(self): 
         return f'@sink(`{self.tbl_wildcard}`)'
@@ -1000,7 +1031,7 @@ def source(tbl_wildcard: str=None):
     return decorator
 
 
-def sink(tbl_wildcard: str=None): 
+def sink(tbl_wildcard: str=None, replica_count: int=1): 
     '''
     Decorate a method to schedule execution of that 
     method as a "@sink".
@@ -1019,7 +1050,7 @@ def sink(tbl_wildcard: str=None):
     '''
     tbl_wildcard = tbl_wildcard or '*'
     def decorator(func): 
-        return SinkStream(tbl_wildcard, func)
+        return SinkStream(tbl_wildcard, func, replica_count=replica_count)
     return decorator
 
 
@@ -1046,12 +1077,15 @@ class StreamGuide(UserDict):
         self.sinks = SinkGuide(self)
 
     def save_stream(self, stream: Stream): 
-        # if stream in self.streams: 
-        #     return
-        stream.guide = self
-        self.streams.append(stream)
-        if isinstance(stream, SourceStream): 
-            self.sources[str(stream)] = stream
+        for i, x in enumerate(range(stream.replica_count)):
+            if i > 0: 
+                x = x.clone(fresh=True)
+                x.replica_number = i + 1
+                x.replica_of = stream
+            x.guide = self
+            self.streams.append(x)
+            if isinstance(x, SourceStream): 
+                self.sources[str(x)] = x
 
     def get(self, key) -> 'SourceStream': 
         return super().get(key)
@@ -1221,7 +1255,10 @@ class Downloader(Operator):
         if issubclass(self.data_buffer_cls, StatisticsBuffer): 
             self.supports_statistics = True
 
-    @sink()
+    def get_replica_count(self): 
+        return get_config('stream_sink_replicas', 3, astype=int)
+    
+    @sink(replica_count=get_replica_count)
     def default_sink(self, stream, tbl, task, **kwds): 
         buf = self.data_buffer_cls(tbl)
         if self.supports_statistics:
@@ -2839,12 +2876,14 @@ class InteractiveSession(BaseContext):
     def is_disabled_tbl(self, tbl): 
         if not self.disabled: 
             return False
-        return str(tbl) in self.disabled_set
+        return str(tbl) in self.disabled_set \
+            or tbl.qualname in self.disabled_set
 
     def is_enabled_tbl(self, tbl): 
         if not self.enabled: 
             return True
-        return str(tbl) in self.enabled_set
+        return str(tbl) in self.enabled_set \
+            or tbl.qualname in self.enabled_set
     
     def results(self): 
         return SessionResult(self)
