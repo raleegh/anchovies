@@ -557,6 +557,7 @@ class IterQueue(Queue):
         if self.should_stop is None:
             yield from iter(self.get, StopIteration)
             return
+        backoff = 0
         while not self.should_stop.is_set():
             try:
                 val = self.get_nowait()
@@ -564,8 +565,10 @@ class IterQueue(Queue):
                     break
                 yield val
                 self.task_done()
+                backoff = 0
             except Empty: 
-                pass
+                time.sleep(0.01 * (2 ** backoff))
+                backoff = min(backoff + 1, 10)
     
     def stop(self): 
         '''Force the queue to shutdown.'''
@@ -655,7 +658,8 @@ class Stream:
     # * is there an option that can use gevent/async
 
     def __iter__(self): 
-        yield from itertools.chain.from_iterable(self._stream)
+        # yield from itertools.chain.from_iterable(self._stream)
+        yield from self._stream
 
     def iter_rows(self, *args, **kwds):
         '''Iterate in sync with the should stop signal.''' 
@@ -900,7 +904,7 @@ class SourceStream(Stream):
             if len(sinks) == 1:
                 self.run_single_sink(sinks[0], **kwds)
             else:
-                for i in self.iter_chunks(**kwds): 
+                for i in self.iter_rows(**kwds): 
                     for sink in sinks: 
                         sink(copy(i))
                 for sink in sinks:
@@ -914,7 +918,7 @@ class SourceStream(Stream):
 
     def run_single_sink(self, ptfn: Callable, **kwds):
         '''Because a single sink is common, optimize for it.'''
-        deque(map(ptfn, map(copy, self.iter_chunks(**kwds))), maxlen=1)
+        deque(map(ptfn, map(copy, self.iter_rows(**kwds))), maxlen=1)
         debug(f'Forward end of stream to {ptfn}')
         ptfn(StopIteration)
 
@@ -1070,18 +1074,23 @@ class StreamGuide(UserDict):
         self.sources = self.data
         for attr, stream in inspect.getmembers(self.op): 
             if isinstance(stream, Stream): 
-                self.save_stream(stream)
+                self.save_stream(stream, attr)
                 for sink in stream.get_substreams(): 
                     self.save_stream(sink)
-                setattr(self.op, attr, stream.make_method(self.op))
+                # setattr(self.op, attr, stream.make_method(self.op))
         self.sinks = SinkGuide(self)
 
-    def save_stream(self, stream: Stream): 
-        for i, x in enumerate(range(stream.replica_count)):
+    def save_stream(self, stream: Stream, attr: str=None): 
+        a = attr
+        for i in range(stream.replica_count):
+            x = stream
             if i > 0: 
                 x = x.clone(fresh=True)
                 x.replica_number = i + 1
                 x.replica_of = stream
+                a = f'{attr}_replica_{i+1}' if attr else None
+            if a: 
+                setattr(self.op, a, x.make_method(self.op))
             x.guide = self
             self.streams.append(x)
             if isinstance(x, SourceStream): 
@@ -1206,6 +1215,18 @@ class Overseer:
         self.session = session
         self.running_streams = list()
         self.mutex = th.RLock()
+        self.should_stop = th.Event()
+        self.monitoring_thread = None
+
+    def start(self):
+        self.monitoring_thread = th.Thread(
+            target=cvar.copy_context().run,
+            args=(self.monitor_running_streams,),
+        )
+        self.monitoring_thread.start()
+        
+    def stop(self): 
+        self.should_stop.set()
 
     def crash(self): 
         '''Stop all running streams.'''
@@ -1213,7 +1234,8 @@ class Overseer:
             for stream in self.running_streams: 
                 stream.stop()
                 self.notify_done(stream)
-
+        self.stop()
+        
     def oversee(self, stream: Stream): 
         '''Attach the overseer to a stream.'''
         with self.mutex:
@@ -1224,6 +1246,25 @@ class Overseer:
     def notify_done(self, stream): 
         '''Remove running stream b/c done.'''
         self.running_streams.remove(stream)
+
+    def monitor_running_streams(self):
+        '''Periodically check running streams for health.'''
+        while not self.should_stop.is_set(): 
+            time.sleep(6)
+            with self.mutex:
+                for stream in self.running_streams: 
+                    self.__monitor_source_stream(stream)
+
+    def __monitor_source_stream(self, stream: SourceStream):
+        '''Iota of work for source specifically.'''
+        for sink in stream._sinks:
+            sink = sink.outermost_for_scheduling()
+            debug(
+                f'Monitoring stream {repr(stream)} --> sink {repr(sink)}: queue size ='
+                f'{(sink._stream.qsize() if sink._stream else 0):,}'
+            )
+            if isinstance(sink, SourceStream):
+                self.__monitor_source_stream(sink)
 
 
 class Downloader(Operator): 
@@ -1255,8 +1296,9 @@ class Downloader(Operator):
         if issubclass(self.data_buffer_cls, StatisticsBuffer): 
             self.supports_statistics = True
 
-    def get_replica_count(self): 
-        return get_config('stream_sink_replicas', 3, astype=int)
+    @staticmethod
+    def get_replica_count(): 
+        return get_config('stream_sink_replicas', 1, astype=int)
     
     @sink(replica_count=get_replica_count)
     def default_sink(self, stream, tbl, task, **kwds): 
@@ -2910,6 +2952,7 @@ class RuntimeSession(InteractiveSession):
         self.connections = ConnectionFairy(op)
         self.connections.connect()
         self.has_started = True
+        self.overseer.start()
         return self
       
     def shutdown(self): 
@@ -2918,6 +2961,7 @@ class RuntimeSession(InteractiveSession):
         as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
         self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
         self.datastore.close()
+        self.overseer.stop()
         super().shutdown()
 
     def actually_shutdown(self, **task_kwds):

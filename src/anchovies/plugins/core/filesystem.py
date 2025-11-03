@@ -109,3 +109,6 @@ class CallbackTempfile(tempfile.SpooledTemporaryFile):
             self.flush()
             self.callback(self)
         super().close()
+
+    def __exit__(self, exc, value, tb):
+        self.close()
