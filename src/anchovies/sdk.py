@@ -1259,7 +1259,7 @@ class Overseer:
         for sink in stream._sinks:
             sink = sink.outermost_for_scheduling()
             debug(
-                f'Monitoring stream {repr(stream)} --> sink {repr(sink)}: queue size ='
+                f'Monitoring stream {repr(stream)} --> sink {repr(sink)}: queue size = '
                 f'{(sink._stream.qsize() if sink._stream else 0):,}'
             )
             if isinstance(sink, SourceStream):

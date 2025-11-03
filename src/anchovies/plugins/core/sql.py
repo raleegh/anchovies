@@ -49,11 +49,9 @@ class Uploader(BaseUploader):
         super().__init__()
         self.schemas = dict()
         self.upload_batch_size = get_config('upload_batch_size', 1024 * 1024 * 8, astype=int)
-        if self.upload_batch_size < 0: 
-            self.upload_batch_size = None
         logger.info(
             'SQL upload limited by '
-            + (f'{self.upload_batch_size:,}' if self.upload_batch_size else 'UNLIMITED')
+            + (f'{self.upload_batch_size:,}' if 0<self.upload_batch_size else 'UNLIMITED')
             + ' bytes'
         )
         # self._wait_for_cleared = Lock()
