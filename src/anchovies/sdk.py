@@ -2776,6 +2776,13 @@ class BaseContext:
             )
     
 
+def parse_env_var_format(s: str) -> str: 
+    '''Parse a string that was loaded from an env var.
+    
+    This replaces escaped newlines with real newlines.
+    '''
+    return s.strip().strip('"').encode('utf-8').decode('unicode_escape')
+
 class InteractiveSession(BaseContext): 
     '''A Session instance used by the CLI.'''
     def __init__(
@@ -2836,6 +2843,9 @@ class InteractiveSession(BaseContext):
                 with open(self._config_file_loc) as f:
                     data = yaml.safe_load(f) 
             if self._config_str and not self._config_file_loc: 
+                if self._config_str.strip().startswith('"'): 
+                    # the config str was loaded in a env var & we have to parse
+                    self._config_str = parse_env_var_format(self._config_str)
                 data = yaml.safe_load(self._config_str)
             assert isinstance(data, dict)
             return data
