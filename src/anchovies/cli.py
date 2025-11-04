@@ -76,6 +76,7 @@ def add_common_customizers(callable):
 @click.option('--enabled', '-e', multiple=True, help='Enable a particular table.')
 @click.option('--disabled', '-d', multiple=True, help='Disable a particular table.')
 @add_common_customizers
+@depends_on_anchovy
 def run_anchovy(
     anchovy: Anchovy,
     operator_cls: str,
