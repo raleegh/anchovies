@@ -2106,13 +2106,18 @@ class TaskStore(Microservice):
 
     def close(self): 
         '''Disconnect from the task store.'''
-        for tsk in self.running_tasks.values():
-            tsk.send()
+        self.cleanup()
         if self._cvtoken:
             OPEN_TASK_STORE.reset(self._cvtoken)
             self._cvtoken = None
         with self._lock:
             self._running_tasks = dict()
+
+    def cleanup(self): 
+        '''Clean up any running tasks.'''
+        with self._lock:
+            for task in self._running_tasks.copy().values():
+                task.send()
 
     def __enter__(self): 
         self.open()
@@ -2333,7 +2338,6 @@ class Task(BaseTaskDataMixin):
             self.completed_at = now()
             if context().batch_id and not self.batch_id: 
                 self.batch_id = context().batch_id
-            # self.maybe_convert_to_exception()
             if not self.duration: 
                 self.duration = round((self.completed_at - self.timestamp).total_seconds() * 1000)
             msg = 'completed'
@@ -3018,7 +3022,6 @@ class RuntimeSession(InteractiveSession):
         if self.has_shutdown: 
             return
         as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
-        self.datastore.task_store.close()
         self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
         self.datastore.close()
         self.overseer.stop()
@@ -3027,6 +3030,7 @@ class RuntimeSession(InteractiveSession):
     def actually_shutdown(self, **task_kwds):
         info(f'shutting down {self} (SHUTDOWN)...')
         self.shutdown_at = now()
+        self.datastore.task_store.cleanup()
         self.connections.close()
         self.has_shutdown = True
 Session = RuntimeSession
