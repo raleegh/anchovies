@@ -24,7 +24,7 @@ class FilesystemDatastore(Datastore):
 
     @staticmethod
     def is_compatible(path):
-        if ':' in path:
+        if '://' in path:
             return False
         try:
             os.makedirs(Path(path).expanduser().absolute(), exist_ok=True)

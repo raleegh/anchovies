@@ -1786,6 +1786,7 @@ class Datastore(Metastore):
     def meta_list_datastores(): 
         '''List registered datastores.'''
         Plugin.discover()  # force walk of entire directory
+        debug('Registered datastores: ' + ', '.join(repr(m) for m in REGISTERED_DATASTORES))
         yield from REGISTERED_DATASTORES
 
     @classmethod
@@ -1794,8 +1795,9 @@ class Datastore(Metastore):
         based on the Datastore uri.
         '''
         # TODO: cache?
-        from anchovies.plugins.core.filesystem import FilesystemDatastore
+        path = path or get_config('datastore')
         if path is None:
+            from anchovies.plugins.core.filesystem import FilesystemDatastore
             return FilesystemDatastore()
         for metastore_cls in self.meta_list_datastores(): 
             if metastore_cls.is_compatible(path): 
@@ -2990,10 +2992,6 @@ class RuntimeSession(InteractiveSession):
         info('𓆟 𓆝 𓆝 𓆟 𓆞 '*8)
         info('')
         info(f'starting up {self} (STARTUP)...')
-        debug(
-            'session config -->\n'
-            + '\n'.join(f'  {k}: {v}' for k,v in self.dump(pretty=True).items())
-        )
         self.startup_at = now()
         if not self.datastore:
             self.datastore = Datastore.new(**self.dump())
@@ -3003,6 +3001,10 @@ class RuntimeSession(InteractiveSession):
         self.connections.connect()
         self.has_started = True
         self.overseer.start()
+        debug(
+            'session config -->\n'
+            + '\n'.join(f'  {k}: {v}' for k,v in self.dump(pretty=True).items())
+        )
         return self
       
     def shutdown(self): 
