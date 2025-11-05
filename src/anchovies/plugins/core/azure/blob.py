@@ -60,7 +60,7 @@ class BlobDatastore(Datastore):
 
     def list_files(self, relpathglob=None, *, after=None, before=None):
         relpathglob = relpathglob or ''
-        start_path = relpathglob.split('*')
+        start_path = relpathglob.split('*')[0]
         stream = self.container.list_blobs(self.qualified(start_path))
         if after: 
             stream = filter(lambda b: b.last_modified >= after, stream)
@@ -87,7 +87,7 @@ class BlobDatastore(Datastore):
 
     def qualified(self, unqualified_path) -> str: 
         '''Append the prefix specified for the datastore connection.'''
-        return self.prefix + '/' + unqualified_path
+        return (self.prefix + '/' + unqualified_path).removeprefix('/')
     
     def unqualified(self, qualified_path: str) -> str: 
         '''Remove the prefix specified for the datastore connection.'''
