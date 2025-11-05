@@ -717,7 +717,7 @@ class Stream:
             kwds = self._prepare_run_as_stream(started_as, started_by, **kwds)
             task = as_task(self.actually_run_as_stream, **kwds)
             return task(**kwds)
-        except BaseException: 
+        except: 
             self.should_stop.set()
             raise
     
@@ -912,7 +912,7 @@ class SourceStream(Stream):
                     sink(StopIteration)
             for fut in self.futures: 
                 fut.join()
-        except BaseException:
+        except:
             self.should_stop.set()
             raise
 
@@ -2342,7 +2342,7 @@ class Task(BaseTaskDataMixin):
                 f'Your anchovy could not be run due to misconfiguration.'
             )
             raise
-        except BaseException: 
+        except: 
             self.convert_to_exception()
             self.mark_done()
             raise

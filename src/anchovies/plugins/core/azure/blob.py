@@ -81,7 +81,7 @@ class BlobDatastore(Datastore):
             def callback(stream: io.BufferedRandom):
                 stream.flush()
                 stream.seek(0) 
-                blob.upload_blob(stream)
+                blob.upload_blob(stream, overwrite=True)
             writer = CallbackTempfile(mode='wb+', callback=callback)
             return cast(io.BufferedWriter, writer)
 
