@@ -1184,6 +1184,12 @@ class StreamingPlan:
         self.seen = ()
         self.please_include = ()
 
+    def run(self, wrapped_by=None, **stream_kwds): 
+        for stream in self.iter_streams(): 
+            if session().overseer.should_stop.is_set():
+                break
+            self.schedule_and_complete(stream, wrapped_by=wrapped_by, **stream_kwds)
+
     def iter_streams(self): 
         seen = self.seen = set()
         please_include = self.please_include = set()
@@ -1203,10 +1209,6 @@ class StreamingPlan:
                 root.schedule_stream(**stream_kwds)
             self.seen.add(root)
             self.seen.update(root.included)
-
-    def run(self, wrapped_by=None, **stream_kwds): 
-        for stream in self.iter_streams(): 
-            self.schedule_and_complete(stream, wrapped_by=wrapped_by, **stream_kwds)
 
 
 class Overseer:
@@ -1245,7 +1247,8 @@ class Overseer:
 
     def notify_done(self, stream): 
         '''Remove running stream b/c done.'''
-        self.running_streams.remove(stream)
+        if stream in self.running_streams:
+            self.running_streams.remove(stream)
 
     def monitor_running_streams(self):
         '''Periodically check running streams for health.'''

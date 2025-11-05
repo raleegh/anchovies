@@ -74,11 +74,10 @@ class BlobDatastore(Datastore):
     def openb(self, path, mode = None, **kwds):
         blob = self.container.get_blob_client(self.qualified(path))
         if mode == 'r':
-            with blob.download_blob() as stream: 
-                buf = CallbackTempfile(mode='wb+')
-                shutil.copyfileobj(stream, buf)
-                buf.seek(0)
-                return cast(io.BufferedReader, buf)
+            buf = CallbackTempfile(mode='wb+')
+            shutil.copyfileobj(blob.download_blob(), buf)
+            buf.seek(0)
+            return cast(io.BufferedReader, buf)
         if mode == 'w': 
             def callback(stream: io.BufferedRandom):
                 stream.flush()
