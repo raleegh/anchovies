@@ -1497,9 +1497,13 @@ class Anchovy:
         return self.run_with_session(ses, operator_cls, **session_kwds)
     
     def run_with_session(self, session: 'Session', operator_cls: type[Downloader], /, **session_kwds): 
-        with session:
+        try:
+            session.startup()
             for b in session.iter_batches(): 
                 b.run()
+            session.shutdown()
+        except: 
+            session.shutdown()
         return session.results()
     
     def run_with_exception_handling(self, operator_cls: type[Downloader], /, **session_kwds) \
@@ -2102,8 +2106,11 @@ class TaskStore(Microservice):
 
     def close(self): 
         '''Disconnect from the task store.'''
+        for tsk in self.running_tasks.values():
+            tsk.send()
         if self._cvtoken:
             OPEN_TASK_STORE.reset(self._cvtoken)
+            self._cvtoken = None
         with self._lock:
             self._running_tasks = dict()
 
@@ -3011,6 +3018,7 @@ class RuntimeSession(InteractiveSession):
         if self.has_shutdown: 
             return
         as_task(self.actually_shutdown, task_type='SHUTDOWN', capture=False)()
+        self.datastore.task_store.close()
         self.datastore.result_store['anchovy_run_results.json'] = self.results().dump()
         self.datastore.close()
         self.overseer.stop()
