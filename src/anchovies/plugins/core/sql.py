@@ -20,7 +20,7 @@ class SchemaMapper(Connection):
 
     Example: 
     ```
-    ACHVY_CNXN__SCHEMAS__NEWNAME=anchovy1
+    ACHVY_CNXN__SCHEMAS__ANCHOVY1=newname
     # this would translate data from `anchvoy1` -> `newname` schema
     ```
     '''

@@ -302,6 +302,7 @@ class NaivePathBuffer(FileDataBuffer):
         self.position = datetime(2001, 1, 1, tzinfo=UTC)
         for path in self.readpaths(1): 
             break
+        self.position = now()
 
     def seek_end(self): 
         self.position = datetime(2001, 1, 1, tzinfo=UTC)
@@ -425,6 +426,7 @@ class DatetimePathBuffer(NaivePathBuffer):
         self.position = datetime(2001, 1, 1, tzinfo=UTC)
         for path in super().readpaths(1): 
             break
+        self.position = now()
 
     def seek_end(self): 
         self.position = now()
