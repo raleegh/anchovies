@@ -1559,14 +1559,40 @@ class Plugin:
             full_path = '.'.join((plugin or '', name)).strip('.')
             if name.startswith('__'): 
                 continue 
-            if isinstance(possible_plugin, ModuleType):
+            if isinstance(possible_plugin, ModuleType) \
+                    or is_namespace(possible_plugin):
                 if not possible_plugin.__name__.startswith('anchovies'): 
                     continue
                 plugins[full_path] = Plugin(full_path, possible_plugin)
                 found = Plugin.discover(full_path)
                 plugins.update(**found)
         return plugins
+    
+
+def is_namespace(mod):
+    '''Check if a module is a namespace package.'''
+    return hasattr(mod, '__path__') and getattr(mod, '__file__', None) is None
             
+
+def better_import(mod):
+    '''Import modules with their namespace packages included.'''
+    mod = importlib.import_module(mod)
+    if '__path__' not in dir(mod):
+        return mod
+    for path in mod.__path__:
+        for possible_namespace in os.listdir(path):
+            if not (
+                    os.path.isdir(os.path.join(path, possible_namespace))
+                    or possible_namespace.endswith('.py')
+                ):
+                continue
+            if possible_namespace.startswith('__'): 
+                continue
+            full_path = f'{mod.__name__}.{possible_namespace.strip(".py")}'
+            namespace = importlib.import_module(full_path)
+            ...
+    return mod
+
 
 @memoize
 def anchovies_import(path: str=None): 
@@ -1588,10 +1614,13 @@ def anchovies_import(path: str=None):
             return path
         full_path = f'anchovies.plugins.{path}' if path else 'anchovies.plugins'
         try: 
+            return better_import(full_path)
+        except ImportError: 
+            pass
+        try: 
             full_path, cls = '.'.join(full_path.split('.')[:-1]), full_path.split('.')[-1]
-            if cls:
-                module = importlib.import_module(full_path)
-                return getattr(module, cls)
+            module = better_import(full_path)
+            return getattr(module, cls)
         except Exception as e: 
             dynamic_import_exception = e
         # attempt importing from global
@@ -2903,9 +2932,9 @@ class InteractiveSession(BaseContext):
             if self.is_task_executor: 
                 break
 
-    def dump(self): 
+    def dump(self, pretty=False): 
         return {
-            k: v 
+            k: (repr(v) if pretty else v)
             for k,v in inspect.getmembers(self)
             if not k.startswith('_') and not callable(v)
         }
@@ -2956,6 +2985,10 @@ class RuntimeSession(InteractiveSession):
         info('𓆟 𓆝 𓆝 𓆟 𓆞 '*8)
         info('')
         info(f'starting up {self} (STARTUP)...')
+        debug(
+            'session config -->\n'
+            + '\n'.join(f'  {k}: {v}' for k,v in self.dump(pretty=True).items())
+        )
         self.startup_at = now()
         if not self.datastore:
             self.datastore = Datastore.new(**self.dump())

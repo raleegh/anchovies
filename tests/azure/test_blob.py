@@ -1,6 +1,7 @@
 import tempfile
 from pytest import fixture
 from unittest.mock import patch
+from anchovies.sdk import Datastore
 from anchovies.plugins.core.azure.blob import BlobDatastore
 
 
