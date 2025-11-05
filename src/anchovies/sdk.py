@@ -1591,7 +1591,7 @@ def better_import(mod):
             mod_name = possible_namespace.removesuffix(".py")
             full_path = f'{mod.__name__}.{mod_name}'
             namespace = importlib.import_module(full_path)
-            if not hasattr(mod):    
+            if not hasattr(mod, mod_name):    
                 setattr(mod, mod_name, namespace)
     return mod
 
