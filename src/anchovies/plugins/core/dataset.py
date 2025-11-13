@@ -8,20 +8,25 @@ import logging
 from abc import ABC
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Sequence, Callable
+from typing import cast, Any, Sequence, Callable
+
+# ensure typing is linter friendly
+class Database: ...
+class Table: ...
+class OriginalTypes: ...
 try:
     from dataset import Database, Table
     from dataset.types import Types as OriginalTypes
     from dataset.table import DatasetException, SQLATable, Column
     from sqlalchemy import select, func
     from sqlalchemy.engine import Engine
+    from sqlalchemy.engine import Connection as SqlConnection
     from sqlalchemy.orm import Session
     String = sqlalchemy.types.Unicode
     Binary = sqlalchemy.types.LargeBinary
 except ImportError: 
-    class Database: ...
-    class Table: ...
-    class OriginalTypes: ...
+    pass
+
 from anchovies.sdk import Connection
 
 
@@ -38,7 +43,7 @@ DataStream = Sequence[dict[str, Any]]
 
 class Dataset(Database, Connection): 
     '''A SQL Dataset.'''
-    executable: Engine
+    engine: Engine
 
     def __init__(
         self, 
@@ -53,9 +58,46 @@ class Dataset(Database, Connection):
         super().__init__(url, schema, engine_kwargs, ensure_schema, row_type, sqlite_wal_mode, on_connect_statements)
         self.types = TypesPlus(is_postgres=self.is_postgres)
         self.table_cls = ScdTable
+        self._context_level = 0
 
     def __getitem__(self, table_name) -> 'TablePlus':
         return super().__getitem__(table_name)
+    
+    def get_executable(self): 
+        '''Get (contextually) a SQLAlchemy Executable for the underlying engine.'''
+        if hasattr(self.local, 'executable'): 
+            return cast(SqlConnection, self.local.executable)
+        return self.engine.connect()
+    
+    def set_executable(self): 
+        '''Add (if not set) a SQLAlchemy Executable to thread's local storage.'''
+        self._context_level += 1
+        if hasattr(self.local, 'executable'): 
+            return
+        self.local.executable = self.engine.connect()
+
+    def unset_executable(self): 
+        '''Remove the SQL Alchemy executable from the thread's local storage.'''
+        self._context_level -= 1
+        if self._context_level == 0: 
+            if hasattr(self.local, 'executable'): 
+                del self.local.executable
+
+    @property
+    def executable(self): 
+        return self.get_executable()
+
+    def begin(self):
+        self.set_executable()
+        return super().begin()
+
+    def commit(self):
+        super().commit()
+        self.unset_executable()
+
+    def rollback(self):
+        super().rollback()
+        self.unset_executable()
     
     def create_table(self, table_name, primary_id=None, primary_type=None, primary_increment=None, **settings) -> 'TablePlus':
         """Create a new table.

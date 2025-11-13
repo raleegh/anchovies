@@ -1,17 +1,23 @@
 import logging
+import concurrent.futures as cf
+from time import sleep
 from pytest import fixture
+from sqlalchemy.pool import QueuePool
 from anchovies.plugins.core.dataset import Dataset, TablePlus, ScdTable
 logging.getLogger('sqlalchemy.engine').setLevel(logging.DEBUG)
 
 
 @fixture
 def db_uri(): 
-    return 'sqlite:///:memory:'
+    return 'sqlite:///:memory:?check_same_thread=False'
 
 
 @fixture
 def dataset(db_uri): 
     yield Dataset(db_uri)
+    # creator = db.engine.pool._creator
+    # db.engine.pool = QueuePool(creator, pool_size=1, max_overflow=1)
+    # yield db
 
 
 def test_insert_many(dataset): 
@@ -47,3 +53,19 @@ def test_scd_insert_many(dataset):
     assert isinstance(tbl, ScdTable)
     assert tbl.count() == 6
     assert tbl.count(_del=None) == 3
+
+
+# def test_16_connections(dataset): 
+#     '''Base dataset has a bad piece of code where you 
+#     essentially can't use more than 15 connections.
+#     '''
+#     def connect_and_sleep(*args): 
+#         with dataset: 
+#             sleep(2)
+#     with cf.ThreadPoolExecutor(2) as exe: 
+#         futs = tuple(exe.map(connect_and_sleep, range(2)))
+#     for fut in cf.as_completed(futs):
+#         fut.result()
+## can't figure out how to test this...
+### base dataset also fails on this but not because of the queue pool
+### sql alchemy uses a SingletonPoolExecutor which doesn't work as expected???
