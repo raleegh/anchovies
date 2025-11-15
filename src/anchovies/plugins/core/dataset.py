@@ -67,21 +67,33 @@ class Dataset(Database, Connection):
         '''Get (contextually) a SQLAlchemy Executable for the underlying engine.'''
         if hasattr(self.local, 'executable'): 
             return cast(SqlConnection, self.local.executable)
-        return self.engine.connect()
+        # this means we are running outside of begin/commit
+        #   have to pull out a connection from the pool
+        if not hasattr(self.local, 'default_executable'): 
+            self.local.default_executable = \
+                self.engine.connect()
+        return self.local.default_executable
     
     def set_executable(self): 
         '''Add (if not set) a SQLAlchemy Executable to thread's local storage.'''
         self._context_level += 1
-        if hasattr(self.local, 'executable'): 
+        if self._context_level > 1: 
             return
+        # return connection from the pool if one exists
+        if hasattr(self.local, 'default_executable'): 
+            self.local.default_executable.close()
+            del self.local.default_executable
         self.local.executable = self.engine.connect()
 
     def unset_executable(self): 
         '''Remove the SQL Alchemy executable from the thread's local storage.'''
         self._context_level -= 1
-        if self._context_level == 0: 
-            if hasattr(self.local, 'executable'): 
-                del self.local.executable
+        if not self._context_level < 1: 
+            return
+        cast(SqlConnection, self.local.executable) \
+            .close()
+        del self.local.executable
+        self._context_level = 0
 
     @property
     def executable(self): 

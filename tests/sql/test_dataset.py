@@ -15,9 +15,20 @@ def db_uri():
 @fixture
 def dataset(db_uri): 
     yield Dataset(db_uri)
-    # creator = db.engine.pool._creator
-    # db.engine.pool = QueuePool(creator, pool_size=1, max_overflow=1)
-    # yield db
+
+
+@fixture
+def dataset_w_limited_pool(db_uri): 
+    # yield Dataset(db_uri)
+    db = Dataset(db_uri)
+    creator = db.engine.pool._creator
+    db.engine.pool = QueuePool(
+        creator, 
+        pool_size=1, 
+        max_overflow=0, 
+        timeout=1,
+    )
+    yield db
 
 
 def test_insert_many(dataset): 
@@ -55,17 +66,32 @@ def test_scd_insert_many(dataset):
     assert tbl.count(_del=None) == 3
 
 
-# def test_16_connections(dataset): 
-#     '''Base dataset has a bad piece of code where you 
-#     essentially can't use more than 15 connections.
-#     '''
-#     def connect_and_sleep(*args): 
-#         with dataset: 
-#             sleep(2)
-#     with cf.ThreadPoolExecutor(2) as exe: 
-#         futs = tuple(exe.map(connect_and_sleep, range(2)))
-#     for fut in cf.as_completed(futs):
-#         fut.result()
-## can't figure out how to test this...
-### base dataset also fails on this but not because of the queue pool
-### sql alchemy uses a SingletonPoolExecutor which doesn't work as expected???
+def test_connection_released_back_to_pool(dataset_w_limited_pool):
+    '''Check that dataset releases connections back to the QueuePool.
+    
+    There is a problem with the basic dataset implementation where 
+    it doesn't send connections back to the SQL Alchemy Pool after use.
+    This means that after 15 connections, an error is raised.
+    '''
+    dataset = dataset_w_limited_pool
+    for _ in range(2): 
+        exe = dataset.executable
+        exe.execute('select 1')
+
+
+
+def test_connection_released_back_to_pool_begin_commit(dataset_w_limited_pool):
+    '''Check that dataset releases connections back to the QueuePool.
+    
+    There is a problem with the basic dataset implementation where 
+    it doesn't send connections back to the SQL Alchemy Pool after use.
+    This means that after 15 connections, an error is raised.
+
+    This test works against the begin/commit interface.
+    '''
+    dataset = dataset_w_limited_pool
+    for _ in range(2): 
+        with dataset: 
+            exe = dataset.executable
+            exe.execute('select 1')
+    
