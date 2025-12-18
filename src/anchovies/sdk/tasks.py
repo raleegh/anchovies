@@ -13,8 +13,11 @@ Using this API will ensure all the microservices and threading
 processes communicate in the same way. Additionally, this should 
 streamline shared scheduling of services & even handling.
 '''
+import sys
+import inspect
 import threading as th
 import uuid
+import traceback
 import logging; logger = logging.getLogger(__name__)
 from abc import ABC
 from typing import Any, Callable, Optional, Self
@@ -56,10 +59,10 @@ class Task(ABC):
     '''
     def __init__(
         self,
-        *,
         target: Optional[Callable]=None,
         args=(),
         kwds: dict=None,
+        *,
         timeout: float=None,
         daemon=False,
         construct=False,
@@ -81,7 +84,7 @@ class Task(ABC):
         self.id = self.make_id()
         self._enter_hit_count = 0
         self.overseer = None
-        self.promised_by: Optional[Self] = None
+        self.owner: Optional[Self] = None
 
     def make_id(self): 
         '''Create the identifier for this Task.'''
@@ -118,14 +121,12 @@ class Task(ABC):
         tgt, args, kwds = self.get_promise_constructor()
         try:
             self.result = tgt(*args, **kwds)
-            for fut in self.promises:
-                fut.join_or_exit()
             self.succeeded.set()
             self.stopped.set()
         except Exception as e: 
             self.exception = e
             self.crash()
-            raise e
+            # raise e
         except: 
             self.crash()
             raise
@@ -141,11 +142,16 @@ class Task(ABC):
         self.__promise.name = repr(self)
 
     def attach_overseer(self): 
+        '''Associate an Overseer instance.
+        
+        By default, the context based Overseer instance will be associated.
+        '''
         from .overseers import overseer
         self.overseer = overseer()
         self.overseer.oversee(self)
 
     def detach_overseer(self): 
+        '''Remove this task from the overseer's realm.'''
         if self.overseer is None:
             return
         self.overseer.notify_done(self)
@@ -160,9 +166,11 @@ class Task(ABC):
                 return
             self.make_promise()
             self.__promise.start()
+            logger.debug(f'starting {self}...')
             return self
         except: 
             self.crash()
+            raise
 
     def start(self):
         '''An alias for `start_or_enter()`.'''
@@ -184,9 +192,10 @@ class Task(ABC):
         A timeout can be set via the `timeout` property. This Task waits 
         on all it's children tasks as well.
         '''
-        if self.is_construct: 
+        if self.is_construct:
             return self.result
         try:
+            logger.debug(f'stopping {self}...')
             return self.actually_join_or_exit()
         except:
             self.crash()
@@ -194,16 +203,22 @@ class Task(ABC):
 
     def actually_join_or_exit(self): 
         '''An internal method to run the join() logic.'''
-        self.__promise.join(self.timeout)
-        if self.is_alive() and not self.crashed.is_set(): 
-            raise TimeoutError(
-                f'{self} timed out waiting for {self.timeout:,}s.'
-            )
-        self.unlink_promise()
-        self.stopped.set()
-        if self.exception: 
-            raise self.exception
-        return self.result
+        try:
+            if self.__promise:
+                self.__promise.join(self.timeout)
+            if self.is_alive() and not self.crashed.is_set(): 
+                raise TimeoutError(
+                    f'{self} timed out waiting for {self.timeout:,}s.'
+                )
+            self.unlink_promise()
+            for fut in self.promises.copy():
+                fut.join_or_exit()
+            if self.exception: 
+                raise self.exception
+            return self.result
+        except Exception: 
+            logger.debug(traceback.format_exc())
+            raise
 
     def join(self): 
         '''An alias for `join_or_exit()`.'''
@@ -224,11 +239,14 @@ class Task(ABC):
 
     def crash(self): 
         '''Stop the execution of this Task & it's children.'''
-        self.crashed.set()
+        self.crashed.set()        
         self.stopped.set()
-        for fut in self.promises: 
+        logger.warning(f'{self} is crashing!')
+        if sys.exc_info()[0]:
+            logger.debug(str(sys.exc_info()[1]))
+        for fut in self.promises.copy(): 
             fut.crash()
-        self.actually_join_or_exit()
+        # self.actually_join_or_exit()
 
     def also_promise(self, task: Self): 
         '''Attach a child Task to this Task.
@@ -236,15 +254,16 @@ class Task(ABC):
         Tasks associated in this way will be shutdown/crashed
         if this Task is also crashed.
         '''
-        task.promised_by = self
+        task.owner = self
         task.maybe_start_or_enter()
         self.promises.add(task)
         return task
     
     def unlink_promise(self): 
         '''If this Task was invoked as a promise, remove the bond.'''
-        if self.promised_by: 
-            self.promised_by.promises.remove(self)
+        if self.owner: 
+            if self in self.owner.promises:
+                self.owner.promises.remove(self)
 
     def on_event(self, event: th.Event, callback: Callable): 
         '''Add a callback to run on an arbitrary event.'''
@@ -313,15 +332,16 @@ class Callback(Task):
     callback_task = task.on_success(some_cleanup_function)
     ```
     '''
-    def __init__(self, task: Task, event, callback, **kwds):
+    def __init__(self, owner: Task, event, callback, **kwds):
+        # self.owner = owner
         self.callback = callback
         callback = self.finalize_callback(event, callback)
         kwds['target'] = callback
         super().__init__(**kwds)
-        self._event = event
+        self.event = event
 
     def __repr__(self):
-        f'Callback({self.owned_by} --{self._event}-> {self.callback.__name__})'
+        return f'Callback({self.owner} --{self.event}-> {self.callback.__name__})'
 
     @property
     def thread_label(self): 
@@ -331,6 +351,10 @@ class Callback(Task):
         '''Wrap the callback with a waiter condition at the start.'''
         def wrapper(): 
             event.wait()
-            callback(self)
+            args = inspect.getcallargs(callback)
+            if args: 
+                callback(self)
+            else: 
+                callback()
         return wrapper
     

@@ -1,16 +1,22 @@
-from .tasks import * 
+from .tasks import Task
 
 
 class Overseer(Task): 
     '''A Task that oversees other tasks.'''
     def __init__(self):
         super().__init__(target=self.monitor, daemon=True)
+        self.tasks = set()
+
+    def __repr__(self):
+        return 'Overseer'
 
     def oversee(self, task: Task): 
         '''An alias for `also_promise()`.'''
         if isinstance(task, Overseer): 
             return
-        return self.also_promise(task)
+        self.tasks.add(task)
+        # task.attach_overseer()
+        # return self.also_promise(task)
     
     def notify_done(self, task: Task): 
         '''Remove a task from the Overseer.'''
@@ -23,6 +29,9 @@ class Overseer(Task):
             for fut in self.promises:
                 if fut.has_checkin:
                     fut.checkin()
+
+    def attach_overseer(self):
+        pass
 
 
 CURRENT_OVERSEER = Overseer().start_or_enter()
