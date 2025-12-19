@@ -276,8 +276,9 @@ class NaivePathBuffer(FileDataBuffer):
         self.tbl = None
         if isinstance(path, Tbl): 
             self.tbl = path
-            if 'datastore_path' in self.tbl.properties: 
-                path = self.tbl.properties['datastore_path']
+            # if 'datastore_path' in self.tbl.properties: 
+            #     path = self.tbl.properties['datastore_path']
+            # TODO: make this work :(
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         if isinstance(path, Tbl): 
