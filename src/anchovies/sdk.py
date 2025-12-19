@@ -840,8 +840,8 @@ class Stream:
             for node in maybe_include.path(): 
                 if fnmatch.fnmatch(self.tbl_wildcard, node.tbl_wildcard) \
                         or fnmatch.fnmatch(node.tbl_wildcard, self.tbl_wildcard):
-                    if node.tbl_wildcard == self.tbl_wildcard: 
-                        continue
+                    # if node.tbl_wildcard == self.tbl_wildcard: 
+                    #     continue
                     self.included.add(maybe_include)
                     break
 
