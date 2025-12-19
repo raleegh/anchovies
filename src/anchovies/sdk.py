@@ -830,14 +830,18 @@ class Stream:
         if self.outermost_for_scheduling()._stream: 
             self.outermost_for_scheduling()._stream.put(obj)
 
-    def include(self, seq=()):
+    def include(self, seq: 'Sequence[Stream]'):
         for maybe_include in seq: 
             if maybe_include is self: 
                 continue
-            path = set(maybe_include.path())
-            if self not in path: 
-                continue
-            self.included.add(maybe_include)
+            # path = set(maybe_include.path())
+            # if self not in path: 
+            #     continue
+            for node in maybe_include.path(): 
+                if fnmatch.fnmatch(self.tbl_wildcard, node.tbl_wildcard) \
+                        or fnmatch.fnmatch(node.tbl_wildcard, self.tbl_wildcard):
+                    self.included.add(maybe_include)
+                    break
 
     def clone(self, new_name: str=None, fresh: bool=False) -> 'Stream':
         new = copy(self)
@@ -2660,7 +2664,7 @@ class TblStore(Microservice):
         '''
         tbls = TblSet()
         for name, data in (context().config_yaml.get('tbls') or {}).items():
-            tbl = runtime().Tbl(name=name, **data)
+            tbl = runtime().Tbl(name=name, **data or {})
             tbls.add(tbl)
         return tbls
 
