@@ -276,6 +276,8 @@ class NaivePathBuffer(FileDataBuffer):
         self.tbl = None
         if isinstance(path, Tbl): 
             self.tbl = path
+            if 'datastore_path' in self.tbl.properties: 
+                path = self.tbl.properties['datastore_path']
         super().__init__(path)
         self.datastore = self.db = datastore or context().datastore
         if isinstance(path, Tbl): 
@@ -526,8 +528,7 @@ class StatisticsBuffer(DatetimePathBuffer):
             f'data change date={self._stats_last_data_change_timestamp} '
             f'lag (seconds)={lag or 0:,}'
         )
+
         
-
-
 # save for export
 DefaultDataBuffer = StatisticsBuffer
